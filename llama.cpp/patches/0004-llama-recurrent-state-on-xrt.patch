@@ -1,0 +1,30 @@
+# This patch modifies llama.cpp, which is licensed under the MIT License
+# (Copyright (c) 2023-2026 The ggml authors). The modified files stay under that license, see THIRD-PARTY-NOTICES.md.
+# Apply with: git apply <patch>  (from the root of llama.cpp commit c92e806d1c81091c9035edce99c35374da1b465e)
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 3d6c6db..4c99483 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -5,6 +5,9 @@
+ #include "llama-io.h"
+ #include "llama-batch.h"
+ #include "llama-model.h"
++#ifdef GGML_USE_XRT
++#include "ggml-xrt.h"
++#endif
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -85,6 +88,12 @@ llama_memory_recurrent::llama_memory_recurrent(
+         if (offload) {
+             auto * dev = model.dev_layer(i);
+             buft = ggml_backend_dev_buffer_type(dev);
++#ifdef GGML_USE_XRT
++            // fpga-llama-gguf: a gemvqc16 kernel with DeltaNet opcodes keeps the recurrent states on the card.
++            if (auto * xrt_rs = ggml_backend_xrt_rs_buffer_type(dev)) {
++                buft = xrt_rs;
++            }
++#endif
+ 
+             dev_name = ggml_backend_dev_name(dev);
+         }

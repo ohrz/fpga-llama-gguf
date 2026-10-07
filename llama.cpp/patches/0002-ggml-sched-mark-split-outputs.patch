@@ -1,0 +1,62 @@
+# This patch modifies llama.cpp, which is licensed under the MIT License
+# (Copyright (c) 2023-2026 The ggml authors). The modified files stay under that license, see THIRD-PARTY-NOTICES.md.
+# Apply with: git apply <patch>  (from the root of llama.cpp commit c92e806d1c81091c9035edce99c35374da1b465e)
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index b2859eb..7caae1c 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -650,7 +650,11 @@ extern "C" {
+         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
++        GGML_TENSOR_FLAG_SPLIT_OUTPUT = 1 << 8, // fpga-llama-gguf: ...is read by a later split of ggml_backend_sched
+     };
++    // fpga-llama-gguf: ggml_backend_sched sets GGML_TENSOR_FLAG_SPLIT_OUTPUT on the data owner of every tensor that a
++    // later split reads, so a backend can skip copying back intermediates that stay inside its own split.
++    #define GGML_SCHED_MARKS_SPLIT_OUTPUTS 1
+ 
+     enum ggml_tri_type {
+         GGML_TRI_TYPE_UPPER_DIAG = 0,
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 8761592..1589dbc 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1375,6 +1375,38 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         sched->n_splits = i_split + 1;
+     }
+ 
++    // fpga-llama-gguf: mark the data owner of every tensor that a later split reads (GGML_TENSOR_FLAG_SPLIT_OUTPUT)
++    {
++        std::vector<int> producer(sched->hash_set.size, -1);
++        for (int s = 0; s < sched->n_splits; s++) {
++            for (int i = sched->splits[s].i_start; i < sched->splits[s].i_end; i++) {
++                graph->nodes[i]->flags &= ~GGML_TENSOR_FLAG_SPLIT_OUTPUT;
++                producer[hash_id(graph->nodes[i])] = s;
++            }
++        }
++        for (int s = 0; s < sched->n_splits; s++) {
++            for (int i = sched->splits[s].i_start; i < sched->splits[s].i_end; i++) {
++                for (int j = 0; j < GGML_MAX_SRC; j++) {
++                    struct ggml_tensor * src = graph->nodes[i]->src[j];
++                    while (src != NULL && src->view_src != NULL) {
++                        src = src->view_src;
++                    }
++                    if (src == NULL) {
++                        continue;
++                    }
++                    const size_t id = ggml_hash_find(&sched->hash_set, src);  // weights may not be in the set
++                    if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) {
++                        continue;
++                    }
++                    const int p = producer[id];
++                    if (p != -1 && p != s) {
++                        src->flags |= GGML_TENSOR_FLAG_SPLIT_OUTPUT;
++                    }
++                }
++            }
++        }
++    }
++
+     if (sched->debug) {
+         ggml_backend_sched_print_assignments(sched, graph);
+     }

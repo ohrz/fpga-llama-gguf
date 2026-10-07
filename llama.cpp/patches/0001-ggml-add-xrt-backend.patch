@@ -1,0 +1,52 @@
+# This patch modifies llama.cpp, which is licensed under the MIT License
+# (Copyright (c) 2023-2026 The ggml authors). The modified files stay under that license, see THIRD-PARTY-NOTICES.md.
+# Apply with: git apply <patch>  (from the root of llama.cpp commit c92e806d1c81091c9035edce99c35374da1b465e)
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 5381c21..ddcb8fa 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -273,6 +273,7 @@ option(GGML_HEXAGON                         "ggml: enable Hexagon backend"
+ set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
+ 
+ option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
++option(GGML_XRT                             "ggml: use the AMD Alveo U50 XRT backend"         OFF)
+ option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
+ 
+ # extra artifacts
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 1158347..7d60c69 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -487,6 +487,7 @@ ggml_add_backend(OpenCL)
+ ggml_add_backend(Hexagon)
+ ggml_add_backend(ZenDNN)
+ ggml_add_backend(OPENVINO)
++ggml_add_backend(XRT)
+ 
+ foreach (target ggml-base ggml)
+     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+index e595946..65d8d06 100644
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -82,6 +82,10 @@
+ #include "ggml-zendnn.h"
+ #endif
+ 
++#ifdef GGML_USE_XRT
++#include "ggml-xrt.h"
++#endif
++
+ #ifdef GGML_USE_OPENVINO
+ #include "ggml-openvino.h"
+ #endif
+@@ -150,6 +154,9 @@ struct ggml_backend_registry {
+ #ifdef GGML_USE_ZENDNN
+         register_backend(ggml_backend_zendnn_reg());
+ #endif
++#ifdef GGML_USE_XRT
++        register_backend(ggml_backend_xrt_reg());
++#endif
+ #ifdef GGML_USE_HEXAGON
+         register_backend(ggml_backend_hexagon_reg());
+ #endif

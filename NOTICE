@@ -1,0 +1,7 @@
+fpga-llama-gguf
+Copyright 2026 The fpga-llama-gguf authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It contains patches to, and needs a checkout of, llama.cpp (https://github.com/ggml-org/llama.cpp), which is
+licensed under the MIT License, Copyright (c) 2023-2026 The ggml authors. See THIRD-PARTY-NOTICES.md.

@@ -1,0 +1,21 @@
+# This patch modifies llama.cpp, which is licensed under the MIT License
+# (Copyright (c) 2023-2026 The ggml authors). The modified files stay under that license, see THIRD-PARTY-NOTICES.md.
+# Apply with: git apply <patch>  (from the root of llama.cpp commit c92e806d1c81091c9035edce99c35374da1b465e)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3a469bc..f6d5670 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -499,7 +499,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             // but is still wrong for cases like --no-kv-offload.
+             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+ 
+-            if (device_fused != device_layer) {
++            // fpga-llama-gguf: a fused op that runs on the CPU next to a device whose buffers are host memory (the XRT
++            // offload backend) needs no copies, so the mismatch is harmless and the fused op stays enabled.
++            const bool host_fallback = device_fused != nullptr && device_layer != nullptr &&
++                ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++                ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(device_layer));
++            if (device_fused != device_layer && !host_fallback) {
+                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+                         "is assigned to device %s (usually due to missing support)\n",
+                         func, node.il,
