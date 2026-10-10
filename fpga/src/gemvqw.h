@@ -14,6 +14,11 @@
 #ifndef GEMVQ_HAS_Q4_1
 #define GEMVQ_HAS_Q4_1 0
 #endif
+// Scale arithmetic of the engines: 1 = exact integer (FP16 scale significands multiplied with the integer block
+// sums and shifted into the fixed-point row accumulator; Q4_1's min term m * s in FP32 per word), 0 = FP32 operators.
+#ifndef GEMVQ_INT_SCALE
+#define GEMVQ_INT_SCALE 1
+#endif
 #ifndef GEMVQ_HAS_Q6_K
 #define GEMVQ_HAS_Q6_K 1
 #endif

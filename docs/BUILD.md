@@ -1,7 +1,7 @@
 # Building and running
 
 Two things are built independently: the **llama.cpp binaries** with the U50 backend (minutes) and the **FPGA
-bitstream** (about 3 hours). Both are needed to run on the card.
+bitstream** (3–4 hours). Both are needed to run on the card.
 
 ## 1. Prerequisites
 
@@ -67,8 +67,9 @@ The patches (`llama.cpp/patches`) do the following:
 scripts/build_xclbin.sh
 ```
 
-This runs `v++ -c` (HLS compile of `fpga/src/gemvqc16.cpp`) and `v++ -l` (link, place and route) for the U50
-platform and writes `build/xclbin/gemvqc16.xclbin`. Environment variables:
+This runs `v++ -c` (HLS compile of `fpga/src/gemvqc16.cpp`, with the operator latencies of
+`fpga/src/gemvqc16_timing.tcl`) and `v++ -l` (link, place and route) for the U50 platform and writes
+`build/xclbin/gemvqc16.xclbin`. Environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -80,18 +81,23 @@ platform and writes `build/xclbin/gemvqc16.xclbin`. Environment variables:
 
 Expect:
 
-- **About 3 hours** on a 16-core desktop CPU (synthesis with 4 jobs, implementation with 1).
+- **3–4 hours** on a 16-core desktop CPU (synthesis with 4 jobs, implementation with 1).
 - **Memory:** the implementation needs more than 28 GB; plan for 48 GB. On a shared machine, run the script with a
   memory limit, for example `systemd-run --user --scope -p MemoryMax=48G -p MemorySwapMax=0 scripts/build_xclbin.sh`.
-- **Resources of the reference build** (after routing, share of the user budget): 330 k LUT (46 %), 4,299 DSP (72 %),
-  622 BRAM (54 %), 33 URAM.
-- **Clock:** the reference build asked for 100 MHz, missed it by 0.4 ns (routing congestion) and the tool lowered
-  the kernel clock to **96.1 MHz** (HBM clock 399.6 MHz), where timing is met. The final clocks are listed in
-  `gemvqc16.xclbin.info` (section *Scalable Clocks*) and printed at the end of the script. A rerun can end up with a
-  slightly different clock; the results in the README were measured at 96.1 MHz.
+- **Resources of the reference build** (after routing, share of the user budget): 404 k LUT (56 %), 3,983 DSP (67 %),
+  723 BRAM (62 %), 185 URAM (29 %).
+- **Clocks:** in the reference build the kernel met the requested **100 MHz** (worst slack +0.015 ns). Paths in the
+  platform's HBM interconnect (`hmss_0`, the width converters of the read channels) missed 450 MHz, and the tool
+  lowered the HBM clock (`hbm_aclk`) to **346.6 MHz**. The final clocks are listed in `gemvqc16.xclbin.info`
+  (section *Scalable Clocks*: `DATA_CLK` is the kernel clock, `hbm_aclk` the HBM clock) and printed at the end of
+  the script. A rerun can end up with slightly different clocks; the results in the README were measured with
+  100 MHz / 346.6 MHz.
 - The kernel ports are connected as in `fpga/connectivity.cfg`: engine `e` (ports `w0`..`w15`) to HBM channels
-  `[2e:2e+1]`, the activation and command buffers to channel 17, the four DeltaNet state ports to channels
-  19, 21, 23 and 25.
+  `[2e:2e+1]`, the activation and command buffers (`act`, `act_rd`, `cmds`) to channel 17, the four DeltaNet state
+  ports to channels 19, 21, 23 and 25.
+- The DeltaNet units use 8 floating-point lanes by default (`GEMVQC_GDN_LANES`, see `fpga/src/gemvqc_gdn.h`); the
+  reference build used this default. 16 lanes compute bit-identical results and would save about 2 ms per token on
+  the 4B model, but need about 560 more DSPs (HLS estimate); that variant has not been built into a bitstream.
 
 ## 4. Running
 
@@ -124,15 +130,19 @@ $B/llama-bench -m models/Qwen3.5-4B-Q4_0.gguf -dev none -ngl 0 -p 512 -n 128 -r 
 | `GGML_XRT_TIMING` | set: print the time spent in graphs, host-to-card copies, launches, waits and copy-back at exit |
 | `GGML_XRT_READBACK_ALL` | `1`: copy every result back to the host (default: only what a later CPU split reads) |
 | `GGML_XRT_WAIT_TIMEOUT_MS` | upper bound for one kernel launch (default 180000) |
+| `GGML_XRT_FEATURE_MASK` | diagnostic: bit mask ANDed with the fusion bits the kernel reports; `0` runs every fusion as its plain command sequence (format and layout bits stay) |
+| `GGML_XRT_PLAN_CACHE` | `0`: analyse every split anew instead of reusing the cached analysis |
+| `GGML_XRT_PLAN_CHECK` | set: rebuild every cached plan and stop if it differs (diagnostic) |
 | `GGML_XRT_DEBUG` | set: verbose log |
 | `GGML_XRT_EMULATE` | `1`: run the kernel as its C++ model on the host (needs the emulator build) |
+| `GGML_XRT_EMULATE_DRY` | set: the emulator skips the kernel model; results are garbage, but host-side timing runs fast |
 
 ### Direct start (optional)
 
-The kernel is normally started through XRT's command scheduler, which costs about 0.2 ms per launch. With about 22
-launches per token this is around 10 % of the token time. `GGML_XRT_DIRECT_START=1` writes the control registers of
-the compute unit directly (about 6 µs) and polls for completion. It needs the driver's embedded scheduler disabled
-through the sysfs file `ert_disable`:
+The kernel is normally started through XRT's command scheduler, which costs about 0.2 ms per launch, with 10–14
+launches per token about 2–3 ms per token. `GGML_XRT_DIRECT_START=1` writes the control registers of the compute
+unit directly (about 6 µs) and polls for completion. It needs the driver's embedded scheduler disabled through the
+sysfs file `ert_disable`:
 
 ```bash
 # 1. load the bitstream once with the scheduler enabled (any run without GGML_XRT_DIRECT_START)
@@ -155,8 +165,9 @@ GGML_XRT_VERIFY_CALLS=1000 build/llama.cpp/build/bin/llama-completion \
 ```
 
 Every checked operation (GEMV, RMSNorm, add, SwiGLU, convolution, DeltaNet step) prints `PASS` with the largest
-absolute difference to the CPU reference, or the process stops with `FAIL`. With the 4B Q4_0 model, 16 generated tokens and
-the reference bitstream, all 6,429 checked operations passed.
+absolute difference to the CPU reference, or the process stops with `FAIL`. Fused commands are checked as a whole.
+With `GGML_XRT_VERIFY_CALLS=3000`, 16 generated tokens and the reference bitstream, all 3,204 checks passed for each
+of the three test models.
 
 ### Without a card (emulator)
 
@@ -167,7 +178,7 @@ GGML_XRT_EMULATE=1 GGML_XRT_KERNEL=gemvqc16 build/llama.cpp/build/bin/llama-comp
 ```
 
 This compiles `fpga/src/gemvqc16.cpp` as plain C++ against the Vitis HLS headers and runs it instead of the card. It
-needs no bitstream and no hardware but is slow: 6 tokens of the 4B model take about 15 minutes. It is meant for
+needs no bitstream and no hardware but is slow: one to two minutes per token for the 4B model. It is meant for
 testing the backend.
 
 ## 5. Troubleshooting
@@ -184,7 +195,7 @@ testing the backend.
 | `XRT kernel wait timed out` | kernel hang; raise `GGML_XRT_WAIT_TIMEOUT_MS` or reset the card (`xbutil reset`) |
 | slower than the table in the README | `OMP_WAIT_POLICY=ACTIVE` and `-t` (number of cores) set? direct start enabled? other load on the host? |
 | `v++ ... ERROR ... platform` | `PLATFORM` does not point to the development platform's `.xpfm` |
-| link ends with a clock below 100 MHz | expected for this design, see "Clock" above; check `gemvqc16.xclbin.info` |
+| link ends with a clock below 100 MHz or `hbm_aclk` below 450 MHz | the tool lowered a clock to meet timing, see "Clocks" above; check `gemvqc16.xclbin.info` |
 
 The numbers in the README were measured on a host whose PCIe link ran at 5 GT/s x8. The U50 supports Gen3 x16, which
 shortens the one-time weight upload but should not change the token rate in steady state.

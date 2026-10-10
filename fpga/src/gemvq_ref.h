@@ -271,6 +271,18 @@ inline bool within_tolerance(float got, float ref, double magnitude) {
     return err <= 1e-6 + 1e-5 * std::fabs(double(ref)) + 1e-6 * magnitude;
 }
 
+// Fused SwiGLU of two GEMV rows (g, u with their references and term magnitudes): the GEMV bounds above carried
+// through y = silu(g) * u (|silu'| <= 1.1), plus the element-wise rounding of silu_mul.
+inline bool within_swiglu(float got, float g_ref, double g_mag, float u_ref, double u_mag) {
+    const double tol_g = 1e-6 + 1e-5 * std::fabs(double(g_ref)) + 1e-6 * g_mag;
+    const double tol_u = 1e-6 + 1e-5 * std::fabs(double(u_ref)) + 1e-6 * u_mag;
+    const double silu = double(g_ref) / (1.0 + std::exp(-double(g_ref)));
+    const double ref = silu * double(u_ref);
+    const double err = std::fabs(double(got) - ref);
+    return err <= 1.1 * tol_g * (std::fabs(double(u_ref)) + tol_u) + std::fabs(silu) * tol_u + 1e-6 +
+                      1e-5 * std::fabs(ref);
+}
+
 // Element-wise references following ggml-cpu: rms_norm sums x^2 in double, scale = 1 / sqrtf(mean + eps), then
 // ggml_mul with the weight; silu(x) = x / (1 + expf(-x)).
 inline std::vector<float> rmsnorm(const float * x, const float * w, unsigned n, float eps) {

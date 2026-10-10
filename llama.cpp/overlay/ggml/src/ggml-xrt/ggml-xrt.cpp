@@ -21,14 +21,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ggml-xrt.h"
@@ -126,7 +129,9 @@ static constexpr size_t XRT_QC_ARENA_BYTES = 250ULL << 20;  // per engine port o
 static constexpr size_t XRT_QC_ARENA_BYTES_PAIR = 384ULL << 20;
 static constexpr size_t XRT_QC_ACT_BYTES = 16ULL << 20;     // inputs region + results of a whole split
 static constexpr int64_t XRT_QC_MAX_COLS = 16384;
-static constexpr int64_t XRT_QC_CMD_ROWS = 65536;           // rows per GEMV command (kernel limit)
+static constexpr int64_t XRT_QC_CMD_ROWS = 65520;           // rows per GEMV command: <= 65536 (kernel limit) and
+                                                             // a multiple of 16 * 5, so chunks start at a multiple
+                                                             // of the engine count (16 or 20)
 // Larger matrices (the output head) are split into several commands; their weights fit next to the layers only with
 // channel-pair arenas.
 static constexpr int64_t XRT_QC_MAX_ROWS_SMALL = 65536;
@@ -160,6 +165,54 @@ struct xrt_qc_mem {
     template <typename T> T map() { return host.empty() ? bo.map<T>() : reinterpret_cast<T>(host.data()); }
 };
 
+// Analysis of one gemvqc16 split (xrt_qc_build_plan): fusions, skipped nodes and use counts. It depends only on the
+// graph structure, so it is kept per split and reused while the structure stays the same (xrt_qc_get_plan).
+struct xrt_qc_plan {
+    struct conv_plan {
+        ggml_tensor * get_rows = nullptr, * concat = nullptr, * cpy = nullptr, * silu = nullptr;
+        bool operator==(const conv_plan & o) const {
+            return get_rows == o.get_rows && concat == o.concat && cpy == o.cpy && silu == o.silu;
+        }
+    };
+    struct gdn_plan {
+        ggml_tensor * get_rows = nullptr, * cpy = nullptr;
+        bool operator==(const gdn_plan & o) const { return get_rows == o.get_rows && cpy == o.cpy; }
+    };
+    struct gdn_norms {
+        bool l2 = false; float l2_eps = 0.0f; ggml_tensor * out = nullptr; const ggml_tensor * w = nullptr;
+        const ggml_tensor * z = nullptr; float rms_eps = 0.0f;
+        // gates: beta = sigmoid(beta_raw), g = softplus(alpha_raw + dt) * a
+        const ggml_tensor * alpha_raw = nullptr, * beta_raw = nullptr, * dt = nullptr, * a = nullptr;
+        bool operator==(const gdn_norms & o) const {
+            return l2 == o.l2 && l2_eps == o.l2_eps && out == o.out && w == o.w && z == o.z && rms_eps == o.rms_eps &&
+                   alpha_raw == o.alpha_raw && beta_raw == o.beta_raw && dt == o.dt && a == o.a;
+        }
+    };
+    std::unordered_map<const ggml_tensor *, conv_plan> convs;  // key: SSM_CONV node
+    std::unordered_map<const ggml_tensor *, gdn_plan> gdns;    // key: GATED_DELTA_NET node
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> conv_of_silu;
+    std::unordered_map<const ggml_tensor *, int> uses;
+    std::unordered_set<const ggml_tensor *> skip;
+    std::unordered_map<const ggml_tensor *, std::pair<ggml_tensor *, ggml_tensor *>> swiglus;  // key: GLU node
+    std::unordered_set<const ggml_tensor *> cont_folded;  // the UNARY nodes
+    std::unordered_map<const ggml_tensor *, int> readers;  // non-view nodes reading a tensor (through views)
+    std::unordered_map<const ggml_tensor *, gdn_norms> norms_of;  // key: GATED_DELTA_NET node
+    std::unordered_set<const ggml_tensor *> add_src, defer_ok, conv_src, late_set;
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> late_gemv;
+    std::unordered_map<const ggml_tensor *, int> last_use;  // filled only with_last_use
+    bool operator==(const xrt_qc_plan & o) const {
+        return convs == o.convs && gdns == o.gdns && conv_of_silu == o.conv_of_silu && uses == o.uses && skip == o.skip &&
+               swiglus == o.swiglus && cont_folded == o.cont_folded && readers == o.readers && norms_of == o.norms_of &&
+               add_src == o.add_src && defer_ok == o.defer_ok && conv_src == o.conv_src && late_set == o.late_set &&
+               late_gemv == o.late_gemv && last_use == o.last_use;
+    }
+};
+
+struct xrt_qc_plan_entry {
+    std::vector<uint64_t> key;  // xrt_qc_plan_key: everything the analysis reads
+    std::unique_ptr<xrt_qc_plan> plan;
+};
+
 struct xrt_backend_context {
     xrt::device device;
     std::string kernel_name;
@@ -187,6 +240,7 @@ struct xrt_backend_context {
     size_t qc_state_rows_used = 0;                         // global state rows handed out (multiple of 4)
     size_t qc_resident_used = 0;                           // floats used in the resident region of act
     std::unordered_map<const void *, unsigned> qc_consts;  // F32 weight data -> resident act offset
+    std::vector<xrt_qc_plan_entry> qc_plans;               // split analyses by graph structure
 };
 
 // ert_disable of the device from sysfs, -1 if it cannot be read. The direct register start needs 1; loading a
@@ -209,15 +263,18 @@ static void xrt_wait(xrt::run & run) {
 struct xrt_timing_totals {
     std::atomic<uint64_t> graph_ns{0}, graph_count{0}, gemv_count{0}, gemv_bytes{0};
     std::atomic<uint64_t> gemv_x_ns{0}, gemv_launch_ns{0}, gemv_wait_ns{0}, gemv_y_ns{0};
+    std::atomic<uint64_t> plan_ns{0}, flush_ns{0};  // gemvqc16 split analysis; whole flushes (graph - flush = build)
+    std::atomic<uint64_t> host_ns{0}, state_ns{0}, operands_ns{0};  // host-only splits, state ops, operand lookup
     bool enabled = std::getenv("GGML_XRT_TIMING") != nullptr;
     ~xrt_timing_totals() {
         if (!enabled) return;
         fprintf(stderr,
                 "XRT-TIMING: graphs=%llu graph_ms=%.1f gemv=%llu gemv_weight_MB=%.1f x_ms=%.1f launch_ms=%.1f "
-                "wait_ms=%.1f y_ms=%.1f\n",
+                "wait_ms=%.1f y_ms=%.1f plan_ms=%.1f flush_ms=%.1f host_ms=%.1f state_ms=%.1f operands_ms=%.1f\n",
                 (unsigned long long) graph_count.load(), graph_ns.load() / 1e6, (unsigned long long) gemv_count.load(),
                 gemv_bytes.load() / 1e6, gemv_x_ns.load() / 1e6, gemv_launch_ns.load() / 1e6,
-                gemv_wait_ns.load() / 1e6, gemv_y_ns.load() / 1e6);
+                gemv_wait_ns.load() / 1e6, gemv_y_ns.load() / 1e6, plan_ns.load() / 1e6, flush_ns.load() / 1e6,
+                host_ns.load() / 1e6, state_ns.load() / 1e6, operands_ns.load() / 1e6);
     }
 };
 static xrt_timing_totals g_xrt_timing;
@@ -265,6 +322,17 @@ static constexpr uint32_t XRT_QC_FEATURE_MARK = 0x6B510000U;
 static constexpr uint32_t XRT_QC_FEATURE_Q5_K = 1U;
 static constexpr uint32_t XRT_QC_FEATURE_Q6_K = 2U;
 static constexpr uint32_t XRT_QC_FEATURE_Q4_1 = 4U;
+static constexpr uint32_t XRT_QC_FEATURE_SWIGLU = 8U;       // GEMV groups, SwiGLU pairs (format bit 8)
+static constexpr uint32_t XRT_QC_FEATURE_STATE_LOAD = 16U;  // STATE_LOAD opcode, GDN on chip (H_v <= 32)
+static constexpr uint32_t XRT_QC_FEATURE_GDN_GEMV = 32U;    // a GDN step and the GEMV behind it in one pass
+static constexpr uint32_t XRT_QC_FEATURE_CONV_EPILOG = 64U; // CONV as epilog of the GEMV that produces its input
+static constexpr uint32_t XRT_QC_FEATURE_GDN_NORMS = 128U;  // GDN with L2 norm of q/k and gated RMS norm of y
+static constexpr uint32_t XRT_QC_FEATURE_ADD_EPILOG = 256U; // residual ADD as epilog of the GEMV
+static constexpr uint32_t XRT_QC_FEATURE_NORM_DEFER = 512U; // deferred RMSNORM: GEMVs quantize the row from the chip
+static constexpr uint32_t XRT_QC_FEATURE_GDN_GATES = 1024U; // GDN computes its gates from the raw projections
+static constexpr uint32_t XRT_QC_FEATURE_STRIDED = 2048U;   // strided rows in RMSNORM and UNARY, UNARY copy
+static constexpr uint32_t XRT_QC_FEATURE_ROPE = 4096U;      // ROPE opcode (rope cache from the host)
+static constexpr uint32_t XRT_QC_FEATURE_Q6K_PACKED = 8192U; // Q6_K in the packed word layout (gemvqw_layout.h)
 
 static uint32_t xrt_active_qc_features() {
     std::lock_guard<std::mutex> lock(xrt_device_context_inst.mutex);
@@ -582,8 +650,9 @@ static uint64_t xrt_qc_weight_offset(xrt_backend_context * ctx, const ggml_tenso
     }
     const unsigned rows = unsigned(weights->ne[1]), cols = unsigned(weights->ne[0]);
     const unsigned format = xrt_qc_format(weights->type, ctx->qc_features);
+    const bool q6k_packed = (ctx->qc_features & XRT_QC_FEATURE_Q6K_PACKED) != 0;
     const auto arenas = gemvqw_layout::repack(static_cast<const uint8_t *>(weights->data), rows, cols, format,
-                                              ctx->qc_engines);
+                                              ctx->qc_engines, q6k_packed);
     size_t need = 0;
     for (const auto & arena : arenas) need = std::max(need, align_xrt_word(arena.size()));
     if (ctx->qc_used + need > ctx->qc_arena_bytes) {
@@ -646,8 +715,12 @@ static bool xrt_qc_supports(const ggml_tensor * op) {
 }
 
 static constexpr unsigned XRT_QC_OP_MUL = 5, XRT_QC_OP_UNARY = 6, XRT_QC_OP_GDN = 7, XRT_QC_OP_CONV = 8;
+static constexpr unsigned XRT_QC_OP_STATE_LOAD = 9, XRT_QC_GEMV_SWIGLU = 0x100, XRT_QC_GDN_WITH_GEMV = 1;
+static constexpr unsigned XRT_QC_GEMV_CONV = 0x200, XRT_QC_GEMV_ADD = 0x400, XRT_QC_GDN_L2_QK = 2, XRT_QC_GDN_GATED = 4;
+static constexpr unsigned XRT_QC_GDN_GATES = 8;
+static constexpr unsigned XRT_QC_OP_ROPE = 10;
 static constexpr unsigned XRT_QC_NORM_L2 = 1, XRT_QC_NORM_NO_WEIGHT = 2;
-static constexpr unsigned XRT_QC_UNARY_SILU = 1, XRT_QC_UNARY_SIGMOID = 2, XRT_QC_UNARY_SOFTPLUS = 3;
+static constexpr unsigned XRT_QC_UNARY_SILU = 1, XRT_QC_UNARY_SIGMOID = 2, XRT_QC_UNARY_SOFTPLUS = 3, XRT_QC_UNARY_COPY = 4;
 static constexpr int64_t XRT_QC_MAX_EW = 4096 * 16;  // element-wise length limit of the on-chip buffers
 static constexpr int64_t XRT_QC_GDN_HEAD = 128;
 
@@ -674,6 +747,93 @@ static bool xrt_qc_unary_kind(const ggml_tensor * op, unsigned * kind) {
     }
 }
 
+// ggml's rope cache for one position (ggml-cpu ops.cpp: rope_yarn, ggml_rope_cache_init, ggml_mrope_cache_init),
+// n_dims floats: cos and sin of pair i at 2i, 2i + 1. The kernel's ROPE rotates with it exactly as ggml does.
+static float xrt_rope_yarn_ramp(const float low, const float high, const int i0) {
+    const float y = (i0 / 2 - low) / std::max(0.001f, high - low);
+    return 1 - std::min(1.0f, std::max(0.0f, y));
+}
+
+static void xrt_rope_yarn(float theta_extrap, float freq_scale, const float corr_dims[2], int64_t i0, float ext_factor,
+                          float mscale, float * cos_theta, float * sin_theta) {
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = xrt_rope_yarn_ramp(corr_dims[0], corr_dims[1], int(i0)) * ext_factor;
+        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cos_theta = cosf(theta) * mscale;
+    *sin_theta = sinf(theta) * mscale;
+}
+
+static std::vector<float> xrt_rope_cache(const ggml_tensor * op) {
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    int sections[4];
+    const int n_dims = ggml_get_op_params_i32(op, 1), mode = ggml_get_op_params_i32(op, 2);
+    const int n_ctx_orig = ggml_get_op_params_i32(op, 4);
+    memcpy(&freq_base, (const int32_t *) op->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (const int32_t *) op->op_params + 6, sizeof(float));
+    memcpy(&ext_factor, (const int32_t *) op->op_params + 7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) op->op_params + 8, sizeof(float));
+    memcpy(&beta_fast, (const int32_t *) op->op_params + 9, sizeof(float));
+    memcpy(&beta_slow, (const int32_t *) op->op_params + 10, sizeof(float));
+    memcpy(&sections, (const int32_t *) op->op_params + 11, sizeof(int) * 4);
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    const int32_t * pos = static_cast<const int32_t *>(op->src[1]->data);
+    const int64_t ne0 = op->ne[0], ne2 = op->ne[2];
+    std::vector<float> cache(static_cast<size_t>(ne0));
+    if (!(mode & GGML_ROPE_TYPE_MROPE)) {
+        float theta = float(pos[0]);
+        for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+            xrt_rope_yarn(theta, freq_scale, corr_dims, i0, ext_factor, attn_factor, &cache[i0], &cache[i0 + 1]);
+            theta *= theta_scale;
+        }
+    } else {
+        const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+        float theta_t = float(pos[0]), theta_h = float(pos[ne2]), theta_w = float(pos[ne2 * 2]), theta_e = float(pos[ne2 * 3]);
+        const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+        const int sec_w = sections[1] + sections[0];
+        for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+            const int sector = int((i0 / 2) % sect_dims);
+            float theta = theta_t;
+            if (is_imrope) {
+                if (sector % 3 == 1 && sector < 3 * sections[1]) theta = theta_h;
+                else if (sector % 3 == 2 && sector < 3 * sections[2]) theta = theta_w;
+                else if (sector % 3 == 0 && sector < 3 * sections[0]) theta = theta_t;
+                else theta = theta_e;
+            } else {
+                if (sector >= sections[0] && sector < sec_w) theta = theta_h;
+                else if (sector >= sec_w && sector < sec_w + sections[2]) theta = theta_w;
+                else if (sector >= sec_w + sections[2]) theta = theta_e;
+            }
+            xrt_rope_yarn(theta, freq_scale, corr_dims, i0, ext_factor, attn_factor, &cache[i0], &cache[i0 + 1]);
+            theta_t *= theta_scale;
+            theta_w *= theta_scale;
+            theta_h *= theta_scale;
+            theta_e *= theta_scale;
+        }
+    }
+    cache.resize(size_t(n_dims));
+    return cache;
+}
+
+// Rows of a single token read with a stride (e.g. the q or gate half of each head of the attention Q projection):
+// F32, rows of a multiple of 16 floats every nb[1] bytes (a whole number of 64-byte words).
+static bool xrt_qc_strided_rows(const ggml_tensor * t) {
+    return (xrt_active_qc_features() & XRT_QC_FEATURE_STRIDED) && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) &&
+           t->ne[0] % 16 == 0 && t->nb[1] % 64 == 0 && t->nb[1] >= size_t(t->ne[0]) * sizeof(float) &&
+           t->nb[1] / 64 <= 0xffff && t->ne[2] == 1 && t->ne[3] == 1 && ggml_nelements(t) <= XRT_QC_MAX_EW &&
+           ggml_nelements(t) <= int64_t(XRT_QC_MAX_COLS) * 4;
+}
+
+// Floats from the first to the last element of strided rows (the act range they occupy).
+static size_t xrt_qc_rows_span(const ggml_tensor * t) {
+    return size_t(t->ne[1] - 1) * (t->nb[1] / sizeof(float)) + size_t(t->ne[0]);
+}
+
 // True if t is (a view of) GET_ROWS from an XRT_RS state: the conv and GDN ops run here only then.
 static bool xrt_qc_rs_rows(const ggml_tensor * t) {
     while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) t = t->src[0];
@@ -696,21 +856,32 @@ static bool xrt_qc_supports_gdn(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
-            return xrt_qc_token_tensor(op) && xrt_qc_token_tensor(a) && op->ne[0] % 16 == 0;
+            return xrt_qc_token_tensor(op) && (xrt_qc_token_tensor(a) || xrt_qc_strided_rows(a)) && op->ne[0] % 16 == 0;
+        case GGML_OP_ROPE: {  // one token, NEOX pairing (NEOX, MROPE, IMROPE), no frequency factors
+            const int n_dims = ggml_get_op_params_i32(op, 1), mode = ggml_get_op_params_i32(op, 2);
+            return (xrt_active_qc_features() & XRT_QC_FEATURE_ROPE) && op->src[2] == nullptr && xrt_qc_token_tensor(op) &&
+                   xrt_qc_token_tensor(a) && b->type == GGML_TYPE_I32 && op->ne[2] == 1 &&
+                   (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) &&
+                   n_dims % 32 == 0 && n_dims <= 128 && n_dims <= op->ne[0] && op->ne[0] % 16 == 0;
+        }
+        case GGML_OP_CONT:  // copy of strided rows (a UNARY copy, or folded into the unary that reads it)
+            return xrt_qc_token_tensor(op) && xrt_qc_strided_rows(a) && ggml_nelements(op) == ggml_nelements(a);
         case GGML_OP_MUL:
             // same-size product, or the weight of a row-wise RMS_NORM broadcast over its rows
             if (!xrt_qc_token_tensor(op) || !xrt_qc_token_tensor(a) || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b)) {
                 return false;
             }
             return ggml_nelements(b) == ggml_nelements(op) ||
-                   (a->op == GGML_OP_RMS_NORM && xrt_qc_token_tensor(a->src[0]) && ggml_nelements(b) == op->ne[0] &&
+                   (a->op == GGML_OP_RMS_NORM && (xrt_qc_token_tensor(a->src[0]) || xrt_qc_strided_rows(a->src[0])) &&
+                    ggml_nelements(b) == op->ne[0] &&
                     op->ne[0] % 16 == 0);
         case GGML_OP_ADD:
             return xrt_qc_token_tensor(op) && xrt_qc_token_tensor(a) && b->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(b) && ggml_nelements(b) == ggml_nelements(op);
         case GGML_OP_UNARY: {
             unsigned kind = 0;
-            return xrt_qc_unary_kind(op, &kind) && xrt_qc_token_tensor(op) && xrt_qc_token_tensor(a);
+            return xrt_qc_unary_kind(op, &kind) && xrt_qc_token_tensor(op) &&
+                   (xrt_qc_token_tensor(a) || (a->op == GGML_OP_CONT && xrt_qc_strided_rows(a->src[0])));
         }
         case GGML_OP_CONCAT:  // conv window of one token: [d_conv - 1, ch] state and the [1, ch] input
             return ggml_get_op_params_i32(op, 0) == 0 && op->type == GGML_TYPE_F32 && op->ne[0] == 4 &&
@@ -727,8 +898,9 @@ static bool xrt_qc_supports_gdn(const ggml_tensor * op) {
                 return t->type == GGML_TYPE_F32 && t->ne[0] == XRT_QC_GDN_HEAD && t->ne[2] == 1 && t->ne[3] == 1 &&
                        t->nb[0] == sizeof(float) && t->nb[1] == XRT_QC_GDN_HEAD * sizeof(float);
             };
+            const int64_t max_hv = (xrt_active_qc_features() & XRT_QC_FEATURE_STATE_LOAD) ? 32 : 64;
             return ggml_get_op_params_i32(op, 0) == 1 && rows_ok(q) && rows_ok(k) && rows_ok(v) && k->ne[1] == hk &&
-                   hk > 0 && hv <= 64 && hv % hk == 0 && g->ne[0] == 1 && be->ne[0] == 1 &&
+                   hk > 0 && hv <= max_hv && hv % hk == 0 && g->ne[0] == 1 && be->ne[0] == 1 &&
                    ggml_nelements(g) == hv && ggml_nelements(be) == hv && ggml_is_contiguous(g) &&
                    ggml_is_contiguous(be) && xrt_qc_rs_rows(op->src[5]);
         }
@@ -745,10 +917,32 @@ struct xrt_qc_list {
     struct entry { const uint8_t * data; size_t bytes; unsigned off; };
     std::vector<unsigned> cmds;
     std::vector<entry> entries;  // inputs and outputs in the order they were added
+    std::deque<std::vector<float>> owned;  // host-made inputs (rope caches): their addresses stay unique
     std::vector<output> outputs;
     std::vector<check> checks;
     std::vector<std::function<void(xrt_backend_context *)>> verifies;  // DeltaNet opcodes
     size_t in_used = 0, out_used = XRT_QC_OUT_BASE;
+    size_t state_load_at = 0;  // command word where the next STATE_LOAD goes: behind the list's last GDN step
+    std::unordered_map<const ggml_tensor *, size_t> late_at;  // GEMV command (word) to move behind its GDN step
+    std::unordered_map<const ggml_tensor *, size_t> conv_src_at;  // GEMV command (word) that may get a CONV epilog
+    std::unordered_map<const ggml_tensor *, size_t> add_src_at;   // GEMV command (word) that may get an ADD epilog
+    // Deferred RMSNORM commands (word positions): only GEMVs of this list read their output. The newest one is the
+    // one the kernel keeps on chip; clearing the flag (undefer) makes a command write its y again.
+    std::unordered_map<const ggml_tensor *, size_t> deferred_at;
+    const ggml_tensor * last_deferred = nullptr;
+    void undefer(const ggml_tensor * t) {
+        const auto it = deferred_at.find(t);
+        if (it == deferred_at.end()) return;
+        cmds[it->second + 7] &= ~4U;
+        deferred_at.erase(it);
+        if (last_deferred == t) last_deferred = nullptr;
+    }
+    // Command words from `from` on moved by `delta` words: keep the recorded positions in step.
+    void shift_positions(size_t from, std::ptrdiff_t delta) {
+        for (auto * m : {&late_at, &conv_src_at, &add_src_at, &deferred_at}) {
+            for (auto & e : *m) if (e.second >= from) e.second = size_t(std::ptrdiff_t(e.second) + delta);
+        }
+    }
     // Readback filter: with last_use set, a flush copies an output back only if a later split reads it, it is a graph
     // output, or a node of this split at or after pos reads it (last_use: data owner -> last reading node).
     const std::unordered_map<const ggml_tensor *, int> * last_use = nullptr;
@@ -882,20 +1076,28 @@ static void xrt_qc_report(const char * what, const char * name, const float * go
 extern "C" int gemvqc16(const void * w0, const void * w1, const void * w2, const void * w3, const void * w4,
                         const void * w5, const void * w6, const void * w7, const void * w8, const void * w9,
                         const void * w10, const void * w11, const void * w12, const void * w13, const void * w14,
-                        const void * w15, void * act, const unsigned * cmds, unsigned n_cmds, const void * st0_rd,
+                        const void * w15,
+#if GGML_XRT_EMULATE_ENGINES == 20
+                        const void * w16, const void * w17, const void * w18, const void * w19,
+#endif
+                        void * act, const unsigned * cmds, unsigned n_cmds, const void * st0_rd,
                         void * st0_wr, const void * st1_rd, void * st1_wr, const void * st2_rd, void * st2_wr,
-                        const void * st3_rd, void * st3_wr);
+                        const void * st3_rd, void * st3_wr, const void * act_rd);
 #endif
 
 static void xrt_qc_emulate_run(xrt_backend_context * ctx, unsigned n_cmds) {
 #ifdef GGML_XRT_GEMVQ_EMULATE
-    std::array<void *, 16> w{};
-    for (unsigned e = 0; e < 16; ++e) w[e] = ctx->qc_weight_bos[e].map<void *>();
+    std::array<void *, GGML_XRT_EMULATE_ENGINES> w{};
+    for (unsigned e = 0; e < w.size(); ++e) w[e] = ctx->qc_weight_bos[e].map<void *>();
     std::array<void *, 4> st{};
     for (unsigned p = 0; p < 4; ++p) st[p] = ctx->qc_state_bos[p].map<void *>();
     const int status = gemvqc16(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12],
-                                w[13], w[14], w[15], ctx->qc_act_bo.map<void *>(), ctx->qc_cmd_bo.map<const unsigned *>(),
-                                n_cmds, st[0], st[0], st[1], st[1], st[2], st[2], st[3], st[3]);
+                                w[13], w[14], w[15],
+#if GGML_XRT_EMULATE_ENGINES == 20
+                                w[16], w[17], w[18], w[19],
+#endif
+                                ctx->qc_act_bo.map<void *>(), ctx->qc_cmd_bo.map<const unsigned *>(),
+                                n_cmds, st[0], st[0], st[1], st[1], st[2], st[2], st[3], st[3], ctx->qc_act_bo.map<void *>());
     if (status != 0) throw std::runtime_error("gemvqc16 model rejected command " + std::to_string(status));
 #else
     (void) ctx;
@@ -907,8 +1109,11 @@ static void xrt_qc_emulate_run(xrt_backend_context * ctx, unsigned n_cmds) {
 // Launches the list, copies every result back to its tensor and runs the optional reference checks.
 // Runs the first n_cmds commands of the command buffer (emulator, direct register start or xrt::run).
 static void xrt_qc_launch(xrt_backend_context * ctx, unsigned n_cmds) {
+    // GGML_XRT_EMULATE_DRY=1 (diagnostic): the emulator skips the kernel model, so host-side timing runs fast;
+    // the results are garbage.
+    static const bool dry = std::getenv("GGML_XRT_EMULATE_DRY") != nullptr;
     if (ctx->qc_emulate) {
-        xrt_qc_emulate_run(ctx, n_cmds);
+        if (!dry || n_cmds == 0) xrt_qc_emulate_run(ctx, n_cmds);
     } else if (ctx->qc_direct) {
         // ap_ctrl_chain: start, poll until done or idle, read ap_return (0x10, the 1-based index of a rejected
         // command), then ap_continue.
@@ -954,11 +1159,29 @@ static uint32_t xrt_qc_probe_features(xrt_backend_context * ctx) {
     ctx->qc_act_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, sizeof(zero), 0);
     uint32_t word = 0;
     ctx->qc_act_bo.read(&word, sizeof(word), 0);
-    return (word & 0xFFFF0000U) == XRT_QC_FEATURE_MARK ? (word & 0xFFFFU) : 0U;
+    const uint32_t features = (word & 0xFFFF0000U) == XRT_QC_FEATURE_MARK ? (word & 0xFFFFU) : 0U;
+    // GGML_XRT_FEATURE_MASK=<bits> (diagnostic): hides fusion bits of the kernel, so their plain command sequences
+    // run instead. The format and layout bits (Q5_K, Q6_K, Q4_1, packed Q6_K) always stay.
+    const char * mask = std::getenv("GGML_XRT_FEATURE_MASK");
+    const uint32_t keep = XRT_QC_FEATURE_Q5_K | XRT_QC_FEATURE_Q6_K | XRT_QC_FEATURE_Q4_1 | XRT_QC_FEATURE_Q6K_PACKED;
+    return mask != nullptr ? features & (uint32_t(std::strtoul(mask, nullptr, 0)) | keep) : features;
 }
 
 static void xrt_qc_flush(xrt_backend_context * ctx, xrt_qc_list & list) {
     if (list.empty()) return;
+    xrt_scoped_ns flush_timer{g_xrt_timing.flush_ns};
+    // A deferred norm whose output a later node still reads (or the host) must write it after all.
+    std::vector<const ggml_tensor *> needed;
+    for (const auto & d : list.deferred_at) {
+        bool later = list.last_use == nullptr ||
+                     (d.first->flags & (GGML_TENSOR_FLAG_SPLIT_OUTPUT | GGML_TENSOR_FLAG_OUTPUT)) != 0;
+        if (!later) {
+            const auto it = list.last_use->find(d.first);
+            later = it != list.last_use->end() && it->second >= list.pos;
+        }
+        if (later) needed.push_back(d.first);
+    }
+    for (const auto * t : needed) list.undefer(t);
     {
         xrt_scoped_ns x_timer{g_xrt_timing.gemv_x_ns};
         ctx->qc_act_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, align_xrt_word(list.in_used * sizeof(float)), 0);
@@ -1066,8 +1289,9 @@ static bool xrt_qc_is_view(const ggml_tensor * node) {
 }
 
 // Appends GEMV commands (row chunks of at most XRT_QC_CMD_ROWS) for MUL_MAT node with x at a_off, y at y_off.
+// flags go into the format word (XRT_QC_GEMV_SWIGLU, only for a single chunk).
 static void xrt_qc_emit_gemv(xrt_backend_context * ctx, xrt_qc_list & list, ggml_tensor * node, unsigned a_off,
-                             unsigned y_off) {
+                             unsigned y_off, unsigned flags = 0) {
     const ggml_tensor * w = node->src[0];
     const unsigned format = xrt_qc_format(w->type, ctx->qc_features);
     const unsigned cols = unsigned(w->ne[0]), n = unsigned(node->ne[0]);
@@ -1076,9 +1300,10 @@ static void xrt_qc_emit_gemv(xrt_backend_context * ctx, xrt_qc_list & list, ggml
     // arena at (r0 / engines) rows past the tensor start.
     for (unsigned r0 = 0; r0 < n; r0 += unsigned(XRT_QC_CMD_ROWS)) {
         const unsigned rows = std::min<unsigned>(unsigned(XRT_QC_CMD_ROWS), n - r0);
-        const uint64_t off = w_off + uint64_t(r0 / ctx->qc_engines) * gemvqw_layout::words_per_row(cols, format);
-        const unsigned cmd[XRT_QC_CMD_WORDS] = {XRT_QC_OP_GEMV, format, rows, cols, unsigned(off), unsigned(off >> 32),
-                                                a_off, y_off + r0};
+        const uint64_t off = w_off + uint64_t(r0 / ctx->qc_engines) *
+                                         gemvqw_layout::words_per_row(cols, format, (ctx->qc_features & XRT_QC_FEATURE_Q6K_PACKED) != 0);
+        const unsigned cmd[XRT_QC_CMD_WORDS] = {XRT_QC_OP_GEMV, format | flags, rows, cols, unsigned(off),
+                                                unsigned(off >> 32), a_off, y_off + r0};
         list.cmds.insert(list.cmds.end(), cmd, cmd + XRT_QC_CMD_WORDS);
     }
     ++g_xrt_timing.gemv_count;
@@ -1195,17 +1420,21 @@ static std::vector<unsigned> xrt_qc_operands(xrt_backend_context * ctx, xrt_qc_l
                                              size_t new_cmds) {
     bool flush = false;
     size_t in = 0;
-    for (const auto & o : ops) {
-        unsigned off = 0;
-        bool overlap = false;
-        if (list.resolve(o.data, o.floats, &off, &overlap)) continue;
-        flush = flush || overlap;
-        if (!xrt_qc_is_weight(o.t)) in += xrt_qc_round16(o.floats);
+    {
+        xrt_scoped_ns operands_timer{g_xrt_timing.operands_ns};
+        for (const auto & o : ops) {
+            unsigned off = 0;
+            bool overlap = false;
+            if (list.resolve(o.data, o.floats, &off, &overlap)) continue;
+            flush = flush || overlap;
+            if (!xrt_qc_is_weight(o.t)) in += xrt_qc_round16(o.floats);
+        }
     }
     flush = flush || list.in_used + in > XRT_QC_OUT_BASE ||
             list.out_used + xrt_qc_round16(out_floats) > xrt_qc_act_floats(ctx) ||
             (list.cmds.size() / XRT_QC_CMD_WORDS + new_cmds) * XRT_QC_CMD_WORDS * sizeof(unsigned) > XRT_QC_CMD_BYTES;
     if (flush) xrt_qc_flush(ctx, list);
+    xrt_scoped_ns operands_timer{g_xrt_timing.operands_ns};
     std::vector<unsigned> offs;
     for (const auto & o : ops) {
         unsigned off = 0;
@@ -1324,27 +1553,34 @@ static std::vector<float> xrt_qc_read_act(xrt_backend_context * ctx, size_t off,
 // r_l, SSM_CONV, SILU) becomes one CONV command, and the state traffic of a GDN step (GET_ROWS of s_l, the
 // GATED_DELTA_NET node, CPY of its new state into s_l) one GDN command; states never leave the card. A row-wise
 // RMS_NORM with its weight MUL becomes one RMSNORM, SILU(z) * x one SILU_MUL. State ops outside these patterns
-// (prompts, sequence starts) run on the host against the card copy.
-static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, struct ggml_cgraph * cgraph) {
+// (prompts, sequence starts) run on the host against the card copy. With the kernel features: gate and up GEMVs
+// whose only reader is a SwiGLU become one SwiGLU pair (no SILU_MUL, gate and up never stored), and every GDN step
+// gets a STATE_LOAD behind the list's previous GDN step, so its state is read while the GEMVs in between run. A
+// GEMV since the previous step whose first reader comes after the step (z of DeltaNet) moves behind the step and
+// runs in the step's pass.
+static const ggml_tensor * xrt_qc_data_root(const ggml_tensor * t) {
+    while (t->view_src != nullptr) t = t->view_src;
+    return t;
+}
+
+static bool xrt_qc_unfused_output(const ggml_tensor * t) {
+    return (t->flags & (GGML_TENSOR_FLAG_SPLIT_OUTPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0;
+}
+
+// The analysis of a split for xrt_qc_graph_compute_gdn; false if a conv or GDN step has an unexpected shape.
+// with_last_use: also fill last_use (data owner -> last reading node) for the readback filter of the lists.
+static bool xrt_qc_build_plan(const xrt_backend_context * ctx, struct ggml_cgraph * cgraph, bool with_last_use,
+                              xrt_qc_plan & P) {
     const int n_nodes = cgraph->n_nodes;
-    for (int i = 0; i < n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (!xrt_qc_is_view(node) && !xrt_qc_supports_gdn(node)) {
-            fprintf(stderr, "XRT: gemvqc16 cannot run node op=%d (%s)\n", node->op, node->name);
-            return GGML_STATUS_FAILED;
-        }
-    }
-    if (xrt_qc_run_on_host(cgraph)) {
-        return GGML_STATUS_SUCCESS;
-    }
-    struct conv_plan { ggml_tensor * get_rows = nullptr, * concat = nullptr, * cpy = nullptr, * silu = nullptr; };
-    struct gdn_plan { ggml_tensor * get_rows = nullptr, * cpy = nullptr; };
-    std::unordered_map<const ggml_tensor *, conv_plan> convs;  // key: SSM_CONV node
-    std::unordered_map<const ggml_tensor *, gdn_plan> gdns;    // key: GATED_DELTA_NET node
-    std::unordered_map<const ggml_tensor *, const ggml_tensor *> conv_of_silu;
-    std::unordered_map<const ggml_tensor *, int> uses;
-    std::vector<const ggml_tensor *> skip;
-    const auto skipped = [&](const ggml_tensor * t) { return std::find(skip.begin(), skip.end(), t) != skip.end(); };
+    using conv_plan = xrt_qc_plan::conv_plan;
+    using gdn_plan = xrt_qc_plan::gdn_plan;
+    using gdn_norms = xrt_qc_plan::gdn_norms;
+    auto & convs = P.convs;
+    auto & gdns = P.gdns;
+    auto & conv_of_silu = P.conv_of_silu;
+    auto & uses = P.uses;
+    auto & skip = P.skip;
+    const auto skipped = [&](const ggml_tensor * t) { return skip.count(t) != 0; };
     for (int i = 0; i < n_nodes; i++) {
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             if (cgraph->nodes[i]->src[s] != nullptr) ++uses[cgraph->nodes[i]->src[s]];
@@ -1364,12 +1600,12 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
             if (p.get_rows == nullptr || p.get_rows->op != GGML_OP_GET_ROWS || xrt_rs_buffer_of(p.get_rows->src[0]) == nullptr ||
                 p.cpy == nullptr || p.cpy->src[0]->view_offs != sizeof(float) || ggml_nelements(p.get_rows->src[1]) != 1) {
                 fprintf(stderr, "XRT: unexpected conv graph around %s\n", node->name);
-                return GGML_STATUS_FAILED;
+                return false;
             }
             convs[node] = p;
-            skip.insert(skip.end(), {p.get_rows, p.concat, p.cpy});
+            skip.insert({p.get_rows, p.concat, p.cpy});
             if (p.silu != nullptr) {
-                skip.push_back(node);
+                skip.insert(node);
                 conv_of_silu[p.silu] = node;
             }
         } else if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -1386,29 +1622,368 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
             if (p.get_rows == nullptr || p.get_rows->op != GGML_OP_GET_ROWS || xrt_rs_buffer_of(p.get_rows->src[0]) == nullptr ||
                 p.cpy == nullptr || ggml_nelements(p.get_rows->src[1]) != 1) {
                 fprintf(stderr, "XRT: unexpected GDN graph around %s\n", node->name);
-                return GGML_STATUS_FAILED;
+                return false;
             }
             gdns[node] = p;
-            skip.insert(skip.end(), {p.get_rows, p.cpy});
+            skip.insert({p.get_rows, p.cpy});
         }
     }
-    const bool verify = ctx->verify_calls_remaining > 0;
-    std::vector<const ggml_tensor *> fused_silu;  // SILU nodes folded into the next MUL
-    xrt_qc_list list;
-    // Results that nothing reads after their list stay on the card. The reference checks read host inputs, so
-    // verification (and GGML_XRT_READBACK_ALL=1) copies everything back.
-    std::unordered_map<const ggml_tensor *, int> last_use;
-    const char * readback_all = std::getenv("GGML_XRT_READBACK_ALL");
-    if (!verify && (readback_all == nullptr || std::strcmp(readback_all, "0") == 0)) {
+    // SwiGLU pairs: GLU(gate, up) of two GEMVs of this split on the same x that nothing else reads.
+    auto & swiglus = P.swiglus;
+    if (ctx->qc_features & XRT_QC_FEATURE_SWIGLU) {
+        const std::unordered_set<const ggml_tensor *> nodes(cgraph->nodes, cgraph->nodes + n_nodes);
+        const auto fusable = [&](const ggml_tensor * m) {
+            return m != nullptr && m->op == GGML_OP_MUL_MAT && nodes.count(m) != 0 && uses[m] == 1 &&
+                   (m->flags & (GGML_TENSOR_FLAG_SPLIT_OUTPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0 &&
+                   m->ne[0] <= XRT_QC_MAX_COLS;
+        };
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_GLU || ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU ||
+                ggml_get_op_params_i32(node, 1) != 0) {
+                continue;
+            }
+            ggml_tensor * g = node->src[0], * u = node->src[1];
+            // The kernel pairs only GEMVs that quantize x the same way (Q8_0, Q8_1 or Q8_K).
+            const auto act_type = [&](const ggml_tensor * m) {
+                const unsigned f = xrt_qc_format(m->src[0]->type, ctx->qc_features);
+                return f == 13U || f == 14U ? 2 : (f == 3U ? 1 : 0);
+            };
+            if (fusable(g) && fusable(u) && g->src[1]->data == u->src[1]->data && g->src[0]->ne[0] == u->src[0]->ne[0] &&
+                g->ne[0] == u->ne[0] && g->ne[0] == node->ne[0] && act_type(g) == act_type(u)) {
+                swiglus[node] = {g, u};
+                skip.insert({g, u});
+            }
+        }
+    }
+    // CONT of strided rows read only by a supported UNARY: the unary reads the rows directly.
+    auto & cont_folded = P.cont_folded;
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * m = cgraph->nodes[i];
+        unsigned kind = 0;
+        if (m->op != GGML_OP_UNARY || !xrt_qc_unary_kind(m, &kind) || m->src[0]->op != GGML_OP_CONT) continue;
+        ggml_tensor * ct = m->src[0];
+        if (uses[ct] == 1 && xrt_qc_strided_rows(ct->src[0]) && (ct->flags & (GGML_TENSOR_FLAG_SPLIT_OUTPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0) {
+            cont_folded.insert(m);
+            skip.insert(ct);
+        }
+    }
+    auto & readers = P.readers;
+    for (int i = 0; i < n_nodes; i++) {
+        if (xrt_qc_is_view(cgraph->nodes[i])) continue;
+        std::unordered_set<const ggml_tensor *> roots;
+        for (const ggml_tensor * src : cgraph->nodes[i]->src) {
+            if (src == nullptr) continue;
+            while (src->view_src != nullptr) src = src->view_src;
+            roots.insert(src);
+        }
+        for (const ggml_tensor * r : roots) ++readers[r];
+    }
+    const auto root_of = xrt_qc_data_root;
+    const auto unfused_output = xrt_qc_unfused_output;
+    // GDN norms: L2_NORM of q and k read only by the step, and the gated norm behind it
+    // (MUL(MUL(RMS_NORM(y), w), SILU(z)), every node read once) become part of the GDN command.
+    auto & norms_of = P.norms_of;
+    if (ctx->qc_features & (XRT_QC_FEATURE_GDN_NORMS | XRT_QC_FEATURE_GDN_GATES)) {
+        const bool norms_on = (ctx->qc_features & XRT_QC_FEATURE_GDN_NORMS) != 0;
+        const bool gates_on = (ctx->qc_features & XRT_QC_FEATURE_GDN_GATES) != 0;
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> only_reader;  // tensor -> its single non-view reader
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor * m = cgraph->nodes[i];
+            if (xrt_qc_is_view(m)) continue;
+            for (const ggml_tensor * src : m->src) if (src != nullptr) only_reader[root_of(src)] = m;
+        }
+        const auto single = [&](const ggml_tensor * t) -> ggml_tensor * {
+            return readers[t] == 1 && unfused_output(t) ? only_reader[t] : nullptr;
+        };
+        for (const auto & gp : gdns) {
+            const ggml_tensor * node = gp.first;
+            gdn_norms nm;
+            const ggml_tensor * q = node->src[0], * k = node->src[1];
+            if (norms_on && q->op == GGML_OP_L2_NORM && k->op == GGML_OP_L2_NORM && single(q) == node && single(k) == node &&
+                ggml_is_contiguous(q->src[0]) && ggml_is_contiguous(k->src[0]) &&
+                ggml_get_op_params_f32(q, 0) == ggml_get_op_params_f32(k, 0)) {
+                nm.l2 = true;
+                nm.l2_eps = ggml_get_op_params_f32(q, 0);
+            }
+            // y (the first hv * 128 floats of the node) -> RMS_NORM rows of 128 -> MUL weight -> MUL SILU(z); the node
+            // is read by that RMS_NORM and the CPY of the new state only.
+            ggml_tensor * r = nullptr;
+            for (int i = 0; i < n_nodes; i++) {
+                ggml_tensor * m = cgraph->nodes[i];
+                if (m->op == GGML_OP_RMS_NORM && root_of(m->src[0]) == node && m->src[0]->view_offs == 0 &&
+                    m->ne[0] == XRT_QC_GDN_HEAD && ggml_nelements(m) == ggml_nelements(node->src[2])) {
+                    r = m;
+                }
+            }
+            ggml_tensor * m1 = r != nullptr ? single(r) : nullptr;
+            ggml_tensor * m2 = m1 != nullptr && m1->op == GGML_OP_MUL && m1->src[0] == r ? single(m1) : nullptr;
+            const ggml_tensor * w = m1 != nullptr ? m1->src[1] : nullptr;
+            const ggml_tensor * sl = m2 != nullptr && m2->op == GGML_OP_MUL && m2->src[0] == m1 ? m2->src[1] : nullptr;
+            if (norms_on && r != nullptr && readers[node] == 2 && w != nullptr && xrt_qc_is_weight(w) && ggml_nelements(w) == r->ne[0] &&
+                sl != nullptr && sl->op == GGML_OP_UNARY && ggml_get_unary_op(sl) == GGML_UNARY_OP_SILU &&
+                single(sl) == m2 && ggml_nelements(sl) == ggml_nelements(m2) && ggml_nelements(m2) == ggml_nelements(r) &&
+                ggml_is_contiguous(sl->src[0]) && ggml_is_contiguous(m2)) {
+                nm.out = m2;
+                nm.w = w;
+                nm.z = sl->src[0];
+                nm.rms_eps = ggml_get_op_params_f32(r, 0);
+                skip.insert({r, m1, const_cast<ggml_tensor *>(sl), m2});
+            }
+            if (nm.l2) skip.insert({const_cast<ggml_tensor *>(q), const_cast<ggml_tensor *>(k)});
+            // Gates: SIGMOID(beta_raw) and MUL(SOFTPLUS(ADD(alpha_raw, dt)), a), every node read once, dt and a weights.
+            const int64_t hv = node->src[2]->ne[1];
+            ggml_tensor * sg = const_cast<ggml_tensor *>(root_of(node->src[4]));
+            ggml_tensor * ml = const_cast<ggml_tensor *>(root_of(node->src[3]));
+            const auto is_w = [&](const ggml_tensor * x) { return x != nullptr && xrt_qc_is_weight(x) && ggml_nelements(x) == hv; };
+            const auto raw = [&](const ggml_tensor * x) { return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == hv; };
+            if (gates_on && sg->op == GGML_OP_UNARY && ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && single(sg) == node &&
+                ml->op == GGML_OP_MUL && single(ml) == node && raw(sg->src[0])) {
+                const int si = ml->src[0]->op == GGML_OP_UNARY ? 0 : 1;
+                ggml_tensor * sp = ml->src[si];
+                const ggml_tensor * a = ml->src[1 - si];
+                ggml_tensor * ad = sp->op == GGML_OP_UNARY && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS && single(sp) == ml
+                                       ? sp->src[0] : nullptr;
+                if (ad != nullptr && ad->op == GGML_OP_ADD && single(ad) == sp && is_w(a)) {
+                    const int di = is_w(ad->src[1]) ? 1 : 0;
+                    if (is_w(ad->src[di]) && raw(ad->src[1 - di])) {
+                        nm.beta_raw = sg->src[0];
+                        nm.alpha_raw = ad->src[1 - di];
+                        nm.dt = ad->src[di];
+                        nm.a = a;
+                        skip.insert({sg, ml, sp, ad});
+                    }
+                }
+            }
+            if (nm.l2 || nm.out != nullptr || nm.alpha_raw != nullptr) norms_of[node] = nm;
+        }
+    }
+    // GEMVs whose only reader is an ADD of the same length whose other operand exists before the GEMV (residual adds
+    // of o_proj, ssm_out, ffn_down): the ADD becomes the GEMV's epilog.
+    auto & add_src = P.add_src;
+    if (ctx->qc_features & XRT_QC_FEATURE_ADD_EPILOG) {
+        std::unordered_map<const ggml_tensor *, int> index;
+        for (int i = 0; i < n_nodes; i++) index[cgraph->nodes[i]] = i;
+        for (int i = 0; i < n_nodes; i++) {
+            const ggml_tensor * add = cgraph->nodes[i];
+            if (add->op != GGML_OP_ADD || skipped(add) || !xrt_qc_supports_gdn(add)) continue;
+            for (int s = 0; s < 2; ++s) {
+                const ggml_tensor * m = root_of(add->src[s]);
+                const ggml_tensor * r = root_of(add->src[1 - s]);
+                const auto im = index.find(m), ir = index.find(r);
+                if (m->op == GGML_OP_MUL_MAT && im != index.end() && !skipped(m) && readers[m] == 1 && unfused_output(m) &&
+                    add->src[s]->data == m->data && ggml_nelements(m) == ggml_nelements(add) && m->ne[0] <= 16384 &&
+                    m->ne[0] >= 256 &&  // short adds (DeltaNet gate bias): leaving the projection group costs more
+                    m->ne[0] % 16 == 0 && (ir == index.end() || ir->second < im->second)) {
+                    add_src.insert(m);
+                    break;
+                }
+            }
+        }
+    }
+    // Norm outputs read only by GEMVs of this split may stay on chip (deferred RMSNORM).
+    auto & defer_ok = P.defer_ok;
+    if (ctx->qc_features & XRT_QC_FEATURE_NORM_DEFER) {
+        std::unordered_map<const ggml_tensor *, bool> only_gemv;
+        for (int i = 0; i < n_nodes; i++) {
+            const ggml_tensor * m = cgraph->nodes[i];
+            if (xrt_qc_is_view(m)) continue;
+            for (const ggml_tensor * src : m->src) {
+                if (src == nullptr) continue;
+                const ggml_tensor * r = root_of(src);
+                const bool ok = m->op == GGML_OP_MUL_MAT && m->src[1] == src;
+                const auto it = only_gemv.find(r);
+                only_gemv[r] = (it == only_gemv.end() || it->second) && ok;
+            }
+        }
+        for (const auto & e : only_gemv) {
+            const ggml_tensor * r = e.first;
+            if (e.second && (r->op == GGML_OP_RMS_NORM || r->op == GGML_OP_L2_NORM || r->op == GGML_OP_MUL) &&
+                unfused_output(r) && ggml_nelements(r) == r->ne[0] && r->ne[0] % 16 == 0 && r->ne[0] <= 16384) {
+                defer_ok.insert(r);
+            }
+        }
+    }
+    // GEMVs whose only reader is the conv window (qkv of DeltaNet): their command gets the conv as epilog.
+    auto & conv_src = P.conv_src;
+    if (ctx->qc_features & XRT_QC_FEATURE_CONV_EPILOG) {
+        const std::unordered_set<const ggml_tensor *> nodes(cgraph->nodes, cgraph->nodes + n_nodes);
+        for (const auto & cv : convs) {
+            const ggml_tensor * x = cv.second.concat->src[1];
+            while (x->view_src != nullptr) x = x->view_src;
+            if (x->op == GGML_OP_MUL_MAT && nodes.count(x) != 0 && !skipped(x) && readers[x] == 1 &&
+                x->ne[0] == cv.first->ne[0] && x->ne[0] <= XRT_QC_CMD_ROWS && cv.second.silu != nullptr &&
+                (x->flags & (GGML_TENSOR_FLAG_SPLIT_OUTPUT | GGML_TENSOR_FLAG_OUTPUT)) == 0) {
+                conv_src.insert(x);
+            }
+        }
+    }
+    // GDN node -> the GEMV for its pass: emitted since the previous GDN node, one command, first read after the step
+    // (readers through views count at the view's first non-view reader). The largest such GEMV wins.
+    auto & late_gemv = P.late_gemv;
+    auto & late_set = P.late_set;
+    if (ctx->qc_features & XRT_QC_FEATURE_GDN_GEMV) {
+        std::unordered_map<const ggml_tensor *, int> first_use;
+        for (int i = 0; i < n_nodes; i++) {
+            if (xrt_qc_is_view(cgraph->nodes[i])) continue;
+            for (const ggml_tensor * src : cgraph->nodes[i]->src) {
+                if (src == nullptr) continue;
+                while (src->view_src != nullptr) src = src->view_src;
+                first_use.emplace(src, i);
+            }
+        }
+        int prev = -1;
+        for (int i = 0; i < n_nodes; i++) {
+            if (cgraph->nodes[i]->op != GGML_OP_GATED_DELTA_NET) continue;
+            const ggml_tensor * best = nullptr;
+            for (int j = prev + 1; j < i; j++) {
+                const ggml_tensor * m = cgraph->nodes[j];
+                const auto it = first_use.find(m);
+                if (m->op == GGML_OP_MUL_MAT && !skipped(m) && m->ne[0] <= XRT_QC_CMD_ROWS &&
+                    (it == first_use.end() || it->second > i) && (best == nullptr || m->ne[0] > best->ne[0])) {
+                    best = m;
+                }
+            }
+            if (best != nullptr) {
+                late_gemv[cgraph->nodes[i]] = best;
+                late_set.insert(best);
+            }
+            prev = i;
+        }
+    }
+    if (with_last_use) {
         for (int i = 0; i < n_nodes; i++) {
             for (const ggml_tensor * src : cgraph->nodes[i]->src) {
                 if (src == nullptr) continue;
                 while (src->view_src != nullptr) src = src->view_src;
-                last_use[src] = i;
+                P.last_use[src] = i;
             }
         }
-        list.last_use = &last_use;
     }
+    return true;
+}
+
+// The fields of t the analysis may read (not the data itself).
+static void xrt_qc_key_tensor(std::vector<uint64_t> & key, const ggml_tensor * t) {
+    key.push_back(uint64_t(reinterpret_cast<uintptr_t>(t)));
+    if (t == nullptr) return;
+    key.push_back(uint64_t(reinterpret_cast<uintptr_t>(t->data)));
+    key.push_back(uint64_t(reinterpret_cast<uintptr_t>(t->buffer)));
+    key.push_back(uint64_t(reinterpret_cast<uintptr_t>(t->view_src)));
+    key.push_back(uint64_t(t->view_offs));
+    key.push_back(uint64_t(t->op) | (uint64_t(t->type) << 16) | (uint64_t(uint32_t(t->flags)) << 32));
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        key.push_back(uint64_t(t->ne[d]));
+        key.push_back(uint64_t(t->nb[d]));
+    }
+    for (int k = 0; k < GGML_MAX_OP_PARAMS / int(sizeof(int32_t)); ++k) key.push_back(uint64_t(uint32_t(t->op_params[k])));
+}
+
+// Exact identity of a split for the plan cache: every node with its fields and source pointers, the fields of
+// sources (and view roots) that are not nodes of the split, the kernel features and whether last_use is wanted.
+static void xrt_qc_plan_key(const xrt_backend_context * ctx, const struct ggml_cgraph * cgraph, bool with_last_use,
+                            std::vector<uint64_t> & key) {
+    key.clear();
+    key.push_back(uint64_t(cgraph->n_nodes));
+    key.push_back(uint64_t(ctx->qc_features) | (uint64_t(with_last_use) << 32));
+    std::unordered_set<const ggml_tensor *> nodes(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
+    const auto add_outside = [&](const ggml_tensor * t) {
+        if (t != nullptr && nodes.count(t) == 0) xrt_qc_key_tensor(key, t);
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        xrt_qc_key_tensor(key, node);
+        int n_src = GGML_MAX_SRC;
+        while (n_src > 0 && node->src[n_src - 1] == nullptr) --n_src;
+        key.push_back(uint64_t(n_src));
+        for (int k = 0; k < n_src; ++k) {
+            const ggml_tensor * src = node->src[k];
+            key.push_back(uint64_t(reinterpret_cast<uintptr_t>(src)));
+            add_outside(src);
+            if (src != nullptr) add_outside(src->view_src);
+        }
+        add_outside(node->view_src);
+    }
+}
+
+// The plan of this split, from the cache when the structure is unchanged (GGML_XRT_PLAN_CACHE=0 turns the cache
+// off; GGML_XRT_PLAN_CHECK=1 rebuilds every cached plan and fails if it differs). nullptr if the analysis fails.
+static const xrt_qc_plan * xrt_qc_get_plan(xrt_backend_context * ctx, struct ggml_cgraph * cgraph, bool with_last_use) {
+    static const bool cache_off = [] {
+        const char * v = std::getenv("GGML_XRT_PLAN_CACHE");
+        return v != nullptr && std::strcmp(v, "0") == 0;
+    }();
+    static const bool check = std::getenv("GGML_XRT_PLAN_CHECK") != nullptr;
+    static thread_local std::vector<uint64_t> key;
+    xrt_qc_plan_key(ctx, cgraph, with_last_use, key);
+    if (!cache_off) {
+        for (const auto & e : ctx->qc_plans) {
+            if (e.key.size() != key.size() || std::memcmp(e.key.data(), key.data(), key.size() * sizeof(uint64_t)) != 0) {
+                continue;
+            }
+            if (check) {
+                xrt_qc_plan fresh;
+                if (!xrt_qc_build_plan(ctx, cgraph, with_last_use, fresh) || !(fresh == *e.plan)) {
+                    throw std::runtime_error("cached gemvqc16 plan differs from a fresh analysis");
+                }
+            }
+            return e.plan.get();
+        }
+    }
+    auto plan = std::make_unique<xrt_qc_plan>();
+    if (!xrt_qc_build_plan(ctx, cgraph, with_last_use, *plan)) return nullptr;
+    if (ctx->qc_plans.size() >= 64) ctx->qc_plans.clear();  // a decode step has ~14 splits
+    ctx->qc_plans.push_back({key, std::move(plan)});
+    return ctx->qc_plans.back().plan.get();
+}
+
+static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, struct ggml_cgraph * cgraph) {
+    const int n_nodes = cgraph->n_nodes;
+    for (int i = 0; i < n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!xrt_qc_is_view(node) && !xrt_qc_supports_gdn(node)) {
+            fprintf(stderr, "XRT: gemvqc16 cannot run node op=%d (%s)\n", node->op, node->name);
+            return GGML_STATUS_FAILED;
+        }
+    }
+    {
+        xrt_scoped_ns host_timer{g_xrt_timing.host_ns};
+        if (xrt_qc_run_on_host(cgraph)) return GGML_STATUS_SUCCESS;
+    }
+    std::optional<xrt_scoped_ns> plan_timer;
+    plan_timer.emplace(g_xrt_timing.plan_ns);
+    const bool verify = ctx->verify_calls_remaining > 0;
+    // Results that nothing reads after their list stay on the card. The reference checks read host inputs, so
+    // verification (and GGML_XRT_READBACK_ALL=1) copies everything back.
+    const char * readback_all = std::getenv("GGML_XRT_READBACK_ALL");
+    const bool with_last_use = !verify && (readback_all == nullptr || std::strcmp(readback_all, "0") == 0);
+    const xrt_qc_plan * plan = xrt_qc_get_plan(ctx, cgraph, with_last_use);
+    if (plan == nullptr) return GGML_STATUS_FAILED;
+    using conv_plan = xrt_qc_plan::conv_plan;
+    using gdn_plan = xrt_qc_plan::gdn_plan;
+    using gdn_norms = xrt_qc_plan::gdn_norms;
+    const auto & convs = plan->convs;
+    const auto & gdns = plan->gdns;
+    const auto & conv_of_silu = plan->conv_of_silu;
+    const auto & swiglus = plan->swiglus;
+    const auto & cont_folded = plan->cont_folded;
+    const auto & norms_of = plan->norms_of;
+    const auto & add_src = plan->add_src;
+    const auto & defer_ok = plan->defer_ok;
+    const auto & conv_src = plan->conv_src;
+    const auto & late_gemv = plan->late_gemv;
+    const auto & late_set = plan->late_set;
+    const auto skipped = [&](const ggml_tensor * t) { return plan->skip.count(t) != 0; };
+    const auto use_count = [&](const ggml_tensor * t) {
+        const auto it = plan->uses.find(t);
+        return it == plan->uses.end() ? 0 : it->second;
+    };
+    const auto root_of = xrt_qc_data_root;
+    const bool state_load = (ctx->qc_features & XRT_QC_FEATURE_STATE_LOAD) != 0;
+    std::vector<const ggml_tensor *> fused_silu;  // SILU nodes folded into the next MUL
+    xrt_qc_list list;
+    if (with_last_use) list.last_use = &plan->last_use;
+    plan_timer.reset();
     for (int i = 0; i < n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         list.pos = i;
@@ -1422,9 +1997,14 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
         switch (node->op) {
             case GGML_OP_MUL_MAT: {
                 const size_t cols = size_t(a->ne[0]);
+                // x from an older deferred norm: the kernel only keeps the newest one on chip.
+                if (root_of(b) != list.last_deferred) list.undefer(root_of(b));
                 const auto offs = xrt_qc_operands(ctx, list, {{b, b->data, cols}}, n,
                                                   (n + XRT_QC_CMD_ROWS - 1) / XRT_QC_CMD_ROWS);
                 const unsigned y_off = xrt_qc_output(list, node, n);
+                if (late_set.count(node) != 0) list.late_at[node] = list.cmds.size();
+                if (conv_src.count(node) != 0) list.conv_src_at[node] = list.cmds.size();
+                if (add_src.count(node) != 0) list.add_src_at[node] = list.cmds.size();
                 xrt_qc_emit_gemv(ctx, list, node, offs[0], y_off);
                 list.checks.push_back({XRT_QC_OP_GEMV, node, offs[0], 0, y_off, unsigned(cols), 0.0f});
                 break;
@@ -1434,9 +2014,9 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
             case GGML_OP_MUL: {
                 const ggml_tensor * norm = node->op == GGML_OP_MUL ? a : node;
                 const bool weight_mul = node->op == GGML_OP_MUL && a->op == GGML_OP_RMS_NORM && i > 0 &&
-                                        cgraph->nodes[i - 1] == a && uses[a] == 1;
+                                        cgraph->nodes[i - 1] == a && use_count(a) == 1;
                 if (node->op != GGML_OP_MUL && next != nullptr && next->op == GGML_OP_MUL && next->src[0] == node &&
-                    node->op == GGML_OP_RMS_NORM && uses[node] == 1) {
+                    node->op == GGML_OP_RMS_NORM && use_count(node) == 1) {
                     break;  // emitted with the weight MUL
                 }
                 if (node->op != GGML_OP_MUL || weight_mul) {
@@ -1444,17 +2024,36 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                     const unsigned flags = (norm->op == GGML_OP_L2_NORM ? XRT_QC_NORM_L2 : 0U) |
                                            (weight_mul ? 0U : XRT_QC_NORM_NO_WEIGHT);
                     const float eps = ggml_get_op_params_f32(norm, 0);
-                    std::vector<xrt_qc_operand> ops = {{norm->src[0], norm->src[0]->data, n}};
+                    const ggml_tensor * nx = norm->src[0];
+                    const bool strided = !xrt_qc_token_tensor(nx);  // xrt_qc_supports_gdn: then strided rows
+                    const unsigned stride_words = strided ? unsigned(nx->nb[1] / 64) : 0U;
+                    std::vector<xrt_qc_operand> ops = {{nx, nx->data, strided ? xrt_qc_rows_span(nx) : n}};
                     if (weight_mul) ops.push_back({b, b->data, row});
-                    const auto offs = xrt_qc_operands(ctx, list, ops, n, 1);
+                    const bool defer = rows == 1 && !strided && defer_ok.count(node) != 0;
+                    const auto offs = xrt_qc_operands(ctx, list, ops, n, defer && verify ? 2 : 1);
                     const unsigned y_off = xrt_qc_output(list, node, n);
                     const unsigned w_off = weight_mul ? offs[1] : 0U;
-                    xrt_qc_push(list, {XRT_QC_OP_RMSNORM, row, offs[0], w_off, y_off, xrt_qc_float_bits(eps), rows, flags});
+                    if (defer) {
+                        // The row stays on chip for the GEMVs on it. With reference checks a plain RMSNORM behind it
+                        // also writes y (the same values), so every check finds its input in act.
+                        if (!verify) list.deferred_at[node] = list.cmds.size();  // with checks y is written anyway
+                        list.last_deferred = node;
+                        xrt_qc_push(list, {XRT_QC_OP_RMSNORM, row, offs[0], w_off, y_off, xrt_qc_float_bits(eps), rows, flags | 4U});
+                    }
+                    if (!defer || verify) {
+                        xrt_qc_push(list, {XRT_QC_OP_RMSNORM, row, offs[0], w_off, y_off, xrt_qc_float_bits(eps), rows,
+                                           flags | (stride_words << 8)});
+                    }
                     if (verify) {
                         const unsigned x_off = offs[0];
                         list.verifies.push_back([=](xrt_backend_context * c) {
                             const float * act = c->qc_act_bo.map<const float *>();
-                            const auto ref = gemvq_ref::rownorm(act + x_off, act + w_off, row, rows, eps, flags);
+                            std::vector<float> xs;  // the rows, packed
+                            for (unsigned r = 0; r < rows; ++r) {
+                                const float * src = act + x_off + size_t(r) * (stride_words ? stride_words * 16U : row);
+                                xs.insert(xs.end(), src, src + row);
+                            }
+                            const auto ref = gemvq_ref::rownorm(xs.data(), act + w_off, row, rows, eps, flags);
                             xrt_qc_report("rmsnorm", node->name, act + y_off, ref, {});
                         });
                     }
@@ -1484,11 +2083,90 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
             }
             case GGML_OP_ADD:
             case GGML_OP_GLU: {
+                if (const auto it = swiglus.find(node); it != swiglus.end()) {
+                    ggml_tensor * g = it->second.first, * u = it->second.second;
+                    const ggml_tensor * x = g->src[1];
+                    if (root_of(x) != list.last_deferred) list.undefer(root_of(x));
+                    const size_t cols = size_t(g->src[0]->ne[0]);
+                    const auto offs = xrt_qc_operands(ctx, list, {{x, x->data, cols}}, n, 2);
+                    const unsigned y_off = xrt_qc_output(list, node, n);
+                    xrt_qc_emit_gemv(ctx, list, g, offs[0], y_off, XRT_QC_GEMV_SWIGLU);
+                    xrt_qc_emit_gemv(ctx, list, u, offs[0], y_off);
+                    if (verify) {
+                        const unsigned x_off = offs[0];
+                        list.verifies.push_back([=](xrt_backend_context * c) {
+                            const float * act = c->qc_act_bo.map<const float *>();
+                            std::vector<double> gm, um;
+                            const auto gr = gemvq_ref::reference(static_cast<const uint8_t *>(g->src[0]->data), act + x_off,
+                                                                 unsigned(n), unsigned(cols),
+                                                                 xrt_qc_format(g->src[0]->type, c->qc_features), gm);
+                            const auto ur = gemvq_ref::reference(static_cast<const uint8_t *>(u->src[0]->data), act + x_off,
+                                                                 unsigned(n), unsigned(cols),
+                                                                 xrt_qc_format(u->src[0]->type, c->qc_features), um);
+                            unsigned bad = 0;
+                            double worst = 0;
+                            for (size_t r = 0; r < n; ++r) {
+                                const double ref = double(gr[r]) / (1.0 + std::exp(-double(gr[r]))) * ur[r];
+                                worst = std::max(worst, std::fabs(double(act[y_off + r]) - ref));
+                                if (!gemvq_ref::within_swiglu(act[y_off + r], gr[r], gm[r], ur[r], um[r])) ++bad;
+                            }
+                            fprintf(stderr, "XRT-VERIFY: %s gemvqc16 swiglu pair %s n=%zu bad=%u max_abs=%g\n",
+                                    bad ? "FAIL" : "PASS", node->name, n, bad, worst);
+                            if (bad) throw std::runtime_error("gemvqc16 result differs from the CPU reference");
+                        });
+                    }
+                    break;
+                }
                 const auto offs = xrt_qc_operands(ctx, list, {{a, a->data, n}, {b, b->data, n}}, n, 1);
                 const unsigned y_off = xrt_qc_output(list, node, n);
+                if (node->op == GGML_OP_ADD) {
+                    // ADD epilog: the ADD goes right behind the GEMV of one operand (still in this list, the operand is
+                    // exactly its y); that GEMV's own y is then never written.
+                    for (int s = 0; s < 2; ++s) {
+                        const ggml_tensor * m = root_of(node->src[s]);  // the GEMV, possibly behind a reshape
+                        const auto aa = list.add_src_at.find(m);
+                        if (aa == list.add_src_at.end() || list.cmds[aa->second + 7] != offs[s]) continue;
+                        const size_t at = aa->second;
+                        list.add_src_at.erase(aa);
+                        list.cmds[at + 1] |= XRT_QC_GEMV_ADD;
+                        const unsigned add_cmd[XRT_QC_CMD_WORDS] = {XRT_QC_OP_ADD, unsigned(n), offs[0], offs[1], y_off, 0, 0, 0};
+                        list.cmds.insert(list.cmds.begin() + std::ptrdiff_t(at + XRT_QC_CMD_WORDS), add_cmd,
+                                         add_cmd + XRT_QC_CMD_WORDS);
+                        list.shift_positions(at + XRT_QC_CMD_WORDS, XRT_QC_CMD_WORDS);
+                        list.checks.erase(std::remove_if(list.checks.begin(), list.checks.end(),
+                                                         [&](const xrt_qc_list::check & k) { return k.node == m; }),
+                                          list.checks.end());
+                        if (verify) {
+                            // The GEMV output is not on the card: reference GEMV + residual, GEMV tolerance.
+                            const unsigned mx_off = list.cmds[at + 6], mcols = list.cmds[at + 3], r_off = offs[1 - s];
+                            const ggml_tensor * mw = m->src[0];
+                            list.verifies.push_back([=](xrt_backend_context * c) {
+                                const float * act = c->qc_act_bo.map<const float *>();
+                                std::vector<double> mag;
+                                const auto ref = gemvq_ref::reference(static_cast<const uint8_t *>(mw->data), act + mx_off,
+                                                                     unsigned(n), mcols, xrt_qc_format(mw->type, c->qc_features), mag);
+                                unsigned bad = 0;
+                                double worst = 0;
+                                for (size_t i = 0; i < n; ++i) {
+                                    const double want = double(ref[i]) + double(act[r_off + i]);
+                                    const double err = std::fabs(double(act[y_off + i]) - want);
+                                    worst = std::max(worst, err);
+                                    if (err > 1e-6 + 1e-5 * std::fabs(double(ref[i])) + 1e-6 * mag[i] + 2e-5 * std::fabs(want)) ++bad;
+                                }
+                                fprintf(stderr, "XRT-VERIFY: %s gemvqc16 add epilog %s n=%zu bad=%u max_abs=%g\n",
+                                        bad ? "FAIL" : "PASS", node->name, n, bad, worst);
+                                if (bad) throw std::runtime_error("gemvqc16 result differs from the CPU reference");
+                            });
+                        }
+                        goto add_done;
+                    }
+                }
+                {
                 const unsigned op = node->op == GGML_OP_ADD ? XRT_QC_OP_ADD : XRT_QC_OP_SILU_MUL;
                 xrt_qc_push(list, {op, unsigned(n), offs[0], offs[1], y_off});
                 list.checks.push_back({op, node, offs[0], offs[1], y_off, unsigned(n), 0.0f});
+                }
+            add_done:
                 break;
             }
             case GGML_OP_UNARY: {
@@ -1506,7 +2184,58 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                     const unsigned s_dst = unsigned(dst_t.card + dst_within / sizeof(float));
                     const auto offs = xrt_qc_operands(ctx, list, {{x, x->data, ch}, {w, w->data, size_t(ch) * 4}}, ch, 1);
                     const unsigned y_off = xrt_qc_output(list, node, ch);
-                    xrt_qc_push(list, {XRT_QC_OP_CONV, ch, offs[0], offs[1], y_off, s_src, s_dst, 1U});
+                    const unsigned conv_cmd[XRT_QC_CMD_WORDS] = {XRT_QC_OP_CONV, ch, offs[0], offs[1], y_off, s_src, s_dst, 1U};
+                    // CONV epilog: the CONV goes right behind the GEMV that produces x (still in this list, x is exactly
+                    // its y); that GEMV's own y is then never written.
+                    const ggml_tensor * src = x;
+                    while (src->view_src != nullptr) src = src->view_src;
+                    const auto ca = list.conv_src_at.find(src);
+                    if (ca != list.conv_src_at.end() && list.cmds[ca->second + 7] == offs[0]) {
+                        const size_t at = ca->second;
+                        list.conv_src_at.erase(ca);
+                        list.cmds[at + 1] |= XRT_QC_GEMV_CONV;
+                        list.cmds.insert(list.cmds.begin() + std::ptrdiff_t(at + XRT_QC_CMD_WORDS), conv_cmd,
+                                         conv_cmd + XRT_QC_CMD_WORDS);
+                        list.shift_positions(at + XRT_QC_CMD_WORDS, XRT_QC_CMD_WORDS);
+                        list.checks.erase(std::remove_if(list.checks.begin(), list.checks.end(),
+                                                         [&](const xrt_qc_list::check & k) { return k.node == src; }),
+                                          list.checks.end());
+                        if (verify) {
+                            // x is not on the card: its reference comes from the weights, and the GEMV tolerance is
+                            // carried through the last tap (|w3| * tol) into y (|silu'| <= 1.1) and the new state.
+                            const auto old_state = xrt_qc_read_act(ctx, s_src, size_t(ch) * 3);
+                            const unsigned qx_off = list.cmds[at + 6], qcols = list.cmds[at + 3], w_off = offs[1];
+                            const ggml_tensor * qw = src->src[0];
+                            list.verifies.push_back([=](xrt_backend_context * c) {
+                                const float * act = c->qc_act_bo.map<const float *>();
+                                std::vector<double> mag;
+                                const auto q = gemvq_ref::reference(static_cast<const uint8_t *>(qw->data), act + qx_off, ch,
+                                                                   qcols, xrt_qc_format(qw->type, c->qc_features), mag);
+                                std::vector<float> new_state;
+                                const auto ref = gemvq_ref::conv(old_state.data(), q.data(), act + w_off, ch, true, new_state);
+                                const auto got = xrt_qc_read_act(c, s_dst, size_t(ch) * 3);
+                                unsigned bad = 0;
+                                double worst = 0;
+                                for (unsigned i = 0; i < ch; ++i) {
+                                    const double tol_q = 1e-6 + 1e-5 * std::fabs(double(q[i])) + 1e-6 * mag[i];
+                                    const double ey = std::fabs(double(act[y_off + i]) - ref[i]);
+                                    const double es = std::fabs(double(got[size_t(i) * 3 + 2]) - q[i]);
+                                    worst = std::max(worst, ey);
+                                    if (ey > 1.1 * std::fabs(double(act[w_off + size_t(i) * 4 + 3])) * tol_q + 1e-6 +
+                                                 2e-5 * std::fabs(double(ref[i])) ||
+                                        es > tol_q || got[size_t(i) * 3] != new_state[size_t(i) * 3] ||
+                                        got[size_t(i) * 3 + 1] != new_state[size_t(i) * 3 + 1]) {
+                                        ++bad;
+                                    }
+                                }
+                                fprintf(stderr, "XRT-VERIFY: %s gemvqc16 conv epilog %s n=%u bad=%u max_abs=%g\n",
+                                        bad ? "FAIL" : "PASS", node->name, ch, bad, worst);
+                                if (bad) throw std::runtime_error("gemvqc16 result differs from the CPU reference");
+                            });
+                        }
+                        break;
+                    }
+                    list.cmds.insert(list.cmds.end(), conv_cmd, conv_cmd + XRT_QC_CMD_WORDS);
                     if (verify) {
                         const auto old_state = xrt_qc_read_act(ctx, s_src, size_t(ch) * 3);
                         const unsigned x_off = offs[0], w_off = offs[1];
@@ -1522,23 +2251,68 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                     break;
                 }
                 if (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU && next != nullptr && next->op == GGML_OP_MUL &&
-                    next->src[1] == node && next->src[0] != node && uses[node] == 1 &&
+                    next->src[1] == node && next->src[0] != node && use_count(node) == 1 &&
                     ggml_nelements(next) == ggml_nelements(node)) {
                     fused_silu.push_back(node);
                     break;  // emitted with the MUL
                 }
                 unsigned kind = 0;
                 xrt_qc_unary_kind(node, &kind);
-                const auto offs = xrt_qc_operands(ctx, list, {{a, a->data, n}}, n, 1);
+                // With a folded CONT the unary reads the strided rows behind it.
+                const ggml_tensor * x = cont_folded.count(node) != 0 ? a->src[0] : a;
+                const bool strided = x != a;
+                const unsigned row = strided ? unsigned(x->ne[0]) : 0U, stride = strided ? unsigned(x->nb[1] / sizeof(float)) : 0U;
+                const auto offs = xrt_qc_operands(ctx, list, {{x, x->data, strided ? xrt_qc_rows_span(x) : n}}, n, 1);
                 const unsigned y_off = xrt_qc_output(list, node, n);
-                xrt_qc_push(list, {XRT_QC_OP_UNARY, unsigned(n), offs[0], kind, y_off});
+                xrt_qc_push(list, {XRT_QC_OP_UNARY, unsigned(n), offs[0], kind, y_off, row, stride});
                 if (verify) {
                     const unsigned x_off = offs[0];
                     list.verifies.push_back([=](xrt_backend_context * c) {
                         const float * act = c->qc_act_bo.map<const float *>();
-                        xrt_qc_report("unary", node->name, act + y_off, gemvq_ref::unary(act + x_off, unsigned(n), kind), {});
+                        std::vector<float> xs;
+                        for (size_t i = 0; i < n; i += (row ? row : n)) {
+                            const float * src = act + x_off + (row ? (i / row) * stride : 0);
+                            xs.insert(xs.end(), src, src + (row ? row : n));
+                        }
+                        xrt_qc_report("unary", node->name, act + y_off, gemvq_ref::unary(xs.data(), unsigned(n), kind), {});
                     });
                 }
+                break;
+            }
+            case GGML_OP_ROPE: {
+                const unsigned nd = unsigned(ggml_get_op_params_i32(node, 1)), ne0 = unsigned(node->ne[0]);
+                const unsigned rows = unsigned(n / ne0);
+                // The cache is uploaded from cs, which then moves into the list (same buffer): its address stays
+                // unique while the list lives, also if the operands flushed the list before.
+                std::vector<float> cs = xrt_rope_cache(node);
+                const std::vector<float> cache = cs;
+                const auto offs = xrt_qc_operands(ctx, list, {{a, a->data, n}, {nullptr, cs.data(), cs.size()}}, n, 1);
+                list.owned.push_back(std::move(cs));
+                const unsigned y_off = xrt_qc_output(list, node, n);
+                xrt_qc_push(list, {XRT_QC_OP_ROPE, nd, offs[0], offs[1], y_off, ne0, rows});
+                if (verify) {
+                    const unsigned x_off = offs[0];
+                    list.verifies.push_back([=](xrt_backend_context * c) {
+                        const float * act = c->qc_act_bo.map<const float *>();
+                        std::vector<float> ref(act + x_off, act + x_off + n);
+                        for (unsigned r = 0; r < rows; ++r) {
+                            for (unsigned i = 0; i < nd / 2; ++i) {  // ggml rotate_pairs, NEOX pairing
+                                const float x0 = act[x_off + r * ne0 + i], x1 = act[x_off + r * ne0 + i + nd / 2];
+                                ref[r * ne0 + i] = x0 * cache[2 * i] - x1 * cache[2 * i + 1];
+                                ref[r * ne0 + i + nd / 2] = x0 * cache[2 * i + 1] + x1 * cache[2 * i];
+                            }
+                        }
+                        xrt_qc_report("rope", node->name, act + y_off, ref, {});
+                    });
+                }
+                break;
+            }
+            case GGML_OP_CONT: {  // not folded into a unary: a strided copy
+                const ggml_tensor * x = a;
+                const auto offs = xrt_qc_operands(ctx, list, {{x, x->data, xrt_qc_rows_span(x)}}, n, 1);
+                const unsigned y_off = xrt_qc_output(list, node, n);
+                xrt_qc_push(list, {XRT_QC_OP_UNARY, unsigned(n), offs[0], XRT_QC_UNARY_COPY, y_off, unsigned(x->ne[0]),
+                                   unsigned(x->nb[1] / sizeof(float))});
                 break;
             }
             case GGML_OP_SSM_CONV:
@@ -1561,20 +2335,100 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                 const unsigned src_row = unsigned(src_t.card + src_within / XRT_QC_STATE_ROW);
                 const unsigned dst_row = unsigned(dst_t.card + dst_within / XRT_QC_STATE_ROW);
                 const float scale = 1.0f / sqrtf(float(S));
-                const auto offs = xrt_qc_operands(ctx, list, {{q, q->data, hk * S}, {k, k->data, hk * S},
-                                                              {v, v->data, hv * S}, {g, g->data, hv}, {be, be->data, hv}},
-                                                  hv * S, 2);
-                const unsigned y_off = xrt_qc_output(list, node, hv * S);
+                const auto ni = norms_of.find(node);
+                const gdn_norms nm = ni != norms_of.end() ? ni->second : gdn_norms();
+                const ggml_tensor * qi = nm.l2 ? q->src[0] : q, * ki = nm.l2 ? k->src[0] : k;  // raw q/k with fused L2
+                const bool gates = nm.alpha_raw != nullptr;
+                const ggml_tensor * gi = gates ? nm.alpha_raw : g, * bi = gates ? nm.beta_raw : be;
+                std::vector<xrt_qc_operand> ops = {{qi, qi->data, hk * S}, {ki, ki->data, hk * S}, {v, v->data, hv * S},
+                                                   {gi, gi->data, hv}, {bi, bi->data, hv}};
+                if (nm.out != nullptr) {
+                    ops.push_back({nm.w, nm.w->data, S});
+                    ops.push_back({nm.z, nm.z->data, hv * S});
+                }
+                if (gates) {
+                    ops.push_back({nm.dt, nm.dt->data, hv});
+                    ops.push_back({nm.a, nm.a->data, hv});
+                }
+                const auto offs = xrt_qc_operands(ctx, list, ops, hv * S, (state_load ? 3 : 2) + (gates ? 1 : 0));
+                // With the gated norm the command writes only its result (the node behind the norm).
+                const unsigned y_off = xrt_qc_output(list, nm.out != nullptr ? nm.out : node, hv * S);
+                const unsigned norm_flags = (nm.l2 ? XRT_QC_GDN_L2_QK : 0U) | (nm.out != nullptr ? XRT_QC_GDN_GATED : 0U) |
+                                            (gates ? XRT_QC_GDN_GATES : 0U);
+                const unsigned dt_off = gates ? offs[ops.size() - 2] : 0U, a_off = gates ? offs[ops.size() - 1] : 0U;
+                const unsigned w_off = nm.out != nullptr ? offs[5] : 0U, z_off = nm.out != nullptr ? offs[6] : 0U;
+                // The step's GEMV, if it is still in this list: its command moves behind the step (nothing in between
+                // reads its y, and act regions of one list are never reused).
+                std::vector<unsigned> late_cmd;
+                if (const auto lg = late_gemv.find(node); lg != late_gemv.end()) {
+                    if (const auto la = list.late_at.find(lg->second); la != list.late_at.end()) {
+                        const auto at = list.cmds.begin() + std::ptrdiff_t(la->second);
+                        late_cmd.assign(at, at + XRT_QC_CMD_WORDS);
+                        const size_t pos = la->second;
+                        list.cmds.erase(at, at + XRT_QC_CMD_WORDS);
+                        list.late_at.erase(la);
+                        list.shift_positions(pos + XRT_QC_CMD_WORDS, -std::ptrdiff_t(XRT_QC_CMD_WORDS));
+                    }
+                }
+                if (state_load) {
+                    // Read the state while the commands since the previous GDN step (projections, conv) run.
+                    const unsigned load[XRT_QC_CMD_WORDS] = {XRT_QC_OP_STATE_LOAD, hv, src_row, 0, 0, 0, 0, 0};
+                    list.cmds.insert(list.cmds.begin() + std::ptrdiff_t(list.state_load_at), load, load + XRT_QC_CMD_WORDS);
+                    list.shift_positions(list.state_load_at, XRT_QC_CMD_WORDS);
+                }
                 xrt_qc_push(list, {XRT_QC_OP_GDN, hv | (hk << 16), offs[0], offs[1], offs[2], offs[3], offs[4], y_off});
-                xrt_qc_push(list, {src_row, dst_row, xrt_qc_float_bits(scale)});
+                xrt_qc_push(list, {src_row, dst_row, xrt_qc_float_bits(scale),
+                                   (late_cmd.empty() ? 0U : XRT_QC_GDN_WITH_GEMV) | norm_flags, xrt_qc_float_bits(nm.l2_eps),
+                                   xrt_qc_float_bits(nm.rms_eps), w_off, z_off});
+                if (gates) xrt_qc_push(list, {dt_off, a_off});
+                list.cmds.insert(list.cmds.end(), late_cmd.begin(), late_cmd.end());
+                list.state_load_at = list.cmds.size();
                 if (verify) {
                     auto state = xrt_qc_read_state(ctx, src_row, hv * S);
                     list.verifies.push_back([=](xrt_backend_context * c) mutable {
                         const float * act = c->qc_act_bo.map<const float *>();
                         std::vector<double> y_mag, s_mag;
-                        const auto ref = gemvq_ref::gdn(state, act + offs[0], act + offs[1], act + offs[2], act + offs[3],
-                                                        act + offs[4], hv, hk, scale, y_mag, s_mag);
-                        xrt_qc_report("gdn", node->name, act + y_off, ref, y_mag);
+                        std::vector<float> qn(act + offs[0], act + offs[0] + hk * S), kn(act + offs[1], act + offs[1] + hk * S);
+                        if (nm.l2) {
+                            qn = gemvq_ref::rownorm(qn.data(), nullptr, unsigned(S), hk, nm.l2_eps, XRT_QC_NORM_L2 | XRT_QC_NORM_NO_WEIGHT);
+                            kn = gemvq_ref::rownorm(kn.data(), nullptr, unsigned(S), hk, nm.l2_eps, XRT_QC_NORM_L2 | XRT_QC_NORM_NO_WEIGHT);
+                        }
+                        std::vector<float> gv(act + offs[3], act + offs[3] + hv), bv(act + offs[4], act + offs[4] + hv);
+                        if (gates) {  // the gate commands' arithmetic on the raw projections
+                            bv = gemvq_ref::unary(bv.data(), hv, XRT_QC_UNARY_SIGMOID);
+                            const auto t1 = gemvq_ref::add(gv.data(), act + dt_off, hv);
+                            const auto t2 = gemvq_ref::unary(t1.data(), hv, XRT_QC_UNARY_SOFTPLUS);
+                            gv = gemvq_ref::mul(t2.data(), act + a_off, hv);
+                        }
+                        const auto ref = gemvq_ref::gdn(state, qn.data(), kn.data(), act + offs[2], gv.data(), bv.data(),
+                                                        hv, hk, scale, y_mag, s_mag);
+                        if (nm.out == nullptr) {
+                            xrt_qc_report("gdn", node->name, act + y_off, ref, y_mag);
+                        } else {
+                            // out = (y * s_h) * w * silu(z): the y tolerance scaled by s_h * |w| * |silu(z)|.
+                            const float * w = act + w_off, * z = act + z_off;
+                            const auto nref = gemvq_ref::rownorm(ref.data(), w, unsigned(S), hv, nm.rms_eps, 0);
+                            const auto oref = gemvq_ref::silu_mul(z, nref.data(), hv * unsigned(S));
+                            unsigned bad = 0;
+                            double worst = 0;
+                            for (unsigned h = 0; h < hv; ++h) {
+                                double sum = 0;
+                                for (size_t j = 0; j < S; ++j) sum += double(ref[h * S + j]) * ref[h * S + j];
+                                const double sh = 1.0 / std::sqrt(sum / double(S) + nm.rms_eps);
+                                for (size_t j = 0; j < S; ++j) {
+                                    const size_t i = h * S + j;
+                                    const double sz = std::fabs(double(z[i]) / (1.0 + std::exp(-double(z[i]))));
+                                    const double tol = (1e-6 + 1e-5 * std::fabs(double(ref[i])) + 4e-6 * y_mag[i]) * sh *
+                                                           std::fabs(double(w[j])) * sz * 1.1 + 1e-6 + 2e-5 * std::fabs(double(oref[i]));
+                                    const double err = std::fabs(double(act[y_off + i]) - oref[i]);
+                                    worst = std::max(worst, err);
+                                    if (err > tol) ++bad;
+                                }
+                            }
+                            fprintf(stderr, "XRT-VERIFY: %s gemvqc16 gdn gated %s n=%u bad=%u max_abs=%g\n",
+                                    bad ? "FAIL" : "PASS", node->name, hv * unsigned(S), bad, worst);
+                            if (bad) throw std::runtime_error("gemvqc16 result differs from the CPU reference");
+                        }
                         const auto got = xrt_qc_read_state(c, dst_row, hv * S);
                         xrt_qc_report("gdn state", node->name, got.data(), state, s_mag);
                     });
@@ -1585,7 +2439,10 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
             case GGML_OP_CPY:
             case GGML_OP_SCALE:
                 xrt_qc_flush(ctx, list);
-                xrt_qc_state_op(ctx, node);
+                {
+                    xrt_scoped_ns state_timer{g_xrt_timing.state_ns};
+                    xrt_qc_state_op(ctx, node);
+                }
                 break;
             default:
                 fprintf(stderr, "XRT: gemvqc16 cannot run node op=%d (%s)\n", node->op, node->name);
@@ -1607,7 +2464,8 @@ static enum ggml_status ggml_backend_xrt_graph_compute(ggml_backend_t backend, s
     ++g_xrt_timing.graph_count;
 
     if (xrt_debug_enabled()) {
-        fprintf(stderr, "XRT-DEBUG: graph_compute nodes=%d\n", cgraph->n_nodes);
+        fprintf(stderr, "XRT-DEBUG: graph_compute nodes=%d first=%s last=%s\n", cgraph->n_nodes,
+                cgraph->n_nodes ? cgraph->nodes[0]->name : "-", cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "-");
     }
 
     try {
@@ -1682,6 +2540,9 @@ static ggml_backend_t ggml_backend_xrt_dev_init_backend(ggml_backend_dev_t dev, 
             // gemvqc16 as its HLS C++ model on host memory: tests the whole backend without a card (slow, one pass
             // over all weights takes seconds).
             ctx->qc_gdn = ctx->qc_emulate = true;
+#ifdef GGML_XRT_EMULATE_ENGINES
+            ctx->qc_engines = GGML_XRT_EMULATE_ENGINES;
+#endif
             ctx->qc_arena_bytes = XRT_QC_ARENA_BYTES_PAIR;
             for (unsigned e = 0; e < ctx->qc_engines; ++e) ctx->qc_weight_bos.emplace_back(ctx->qc_arena_bytes);
             ctx->qc_act_bo = xrt_qc_mem(XRT_QC_ACT_BYTES_GDN);
@@ -1719,6 +2580,17 @@ static ggml_backend_t ggml_backend_xrt_dev_init_backend(ggml_backend_dev_t dev, 
         // Engine ports on single channels get 250 MiB arenas, ports on channel pairs 384 MiB. The arenas are
         // allocated first, so each starts at the bottom of its pair and the other buffers fit behind it.
         const xrt::xclbin xclbin(xclbin_path);
+        // One weight port w<e> per engine (16 or 20).
+        ctx->qc_engines = 0;
+        for (const auto & arg : xclbin.get_kernel(ctx->kernel_name).get_args()) {
+            const std::string name = arg.get_name();
+            if (name.size() > 1 && name[0] == 'w' && name.find_first_not_of("0123456789", 1) == std::string::npos) {
+                ++ctx->qc_engines;
+            }
+        }
+        if (ctx->qc_engines != 16 && ctx->qc_engines != 20) {
+            throw std::runtime_error("gemvqc16: unexpected number of weight ports (" + std::to_string(ctx->qc_engines) + ")");
+        }
         size_t engine_bank_bytes = SIZE_MAX;
         for (unsigned e = 0; e < ctx->qc_engines; ++e) {
             size_t bytes = 0;
@@ -1743,7 +2615,16 @@ static ggml_backend_t ggml_backend_xrt_dev_init_backend(ggml_backend_dev_t dev, 
             for (const auto & arg : meta.get_args()) {
                 if (arg.get_name() == "st0_rd") ctx->qc_gdn = true;
             }
-            ctx->qc_gdn = ctx->qc_gdn && meta.get_num_args() == size_t(act_arg) + 3 + 2 * XRT_QC_STATE_PORTS;
+            ctx->qc_gdn = ctx->qc_gdn && (meta.get_num_args() == size_t(act_arg) + 3 + 2 * XRT_QC_STATE_PORTS ||
+                                          meta.get_num_args() == size_t(act_arg) + 4 + 2 * XRT_QC_STATE_PORTS);
+        }
+        // Kernels with the CONV epilog read act a second time through act_rd (last argument, same buffer).
+        int act_rd_arg = -1;
+        for (const auto & arg : meta.get_args()) {
+            if (arg.get_name() == "act_rd") act_rd_arg = int(arg.get_index());
+        }
+        if (act_rd_arg >= 0 && (!ctx->qc_gdn || act_rd_arg != act_arg + 3 + int(2 * XRT_QC_STATE_PORTS))) {
+            throw std::runtime_error("gemvqc16: unexpected position of act_rd in the xclbin");
         }
         ctx->qc_act_bo = xrt_qc_mem(xrt::bo(ctx->device, ctx->qc_gdn ? XRT_QC_ACT_BYTES_GDN : XRT_QC_ACT_BYTES,
                                             bank(act_arg)));
@@ -1756,9 +2637,11 @@ static ggml_backend_t ggml_backend_xrt_dev_init_backend(ggml_backend_dev_t dev, 
             if (arg < act_arg) return ctx->qc_weight_bos[arg].bo;
             if (arg == act_arg) return ctx->qc_act_bo.bo;
             if (arg == act_arg + 1) return ctx->qc_cmd_bo.bo;
+            if (arg == act_rd_arg) return ctx->qc_act_bo.bo;
             return ctx->qc_state_bos[(arg - act_arg - 3) / 2].bo;
         };
-        const int n_buffer_args = act_arg + 2 + (ctx->qc_gdn ? int(2 * XRT_QC_STATE_PORTS) + 1 : 0);
+        const int n_buffer_args = act_rd_arg >= 0 ? act_rd_arg + 1
+                                                  : act_arg + 2 + (ctx->qc_gdn ? int(2 * XRT_QC_STATE_PORTS) + 1 : 0);
         const char * direct_env = std::getenv("GGML_XRT_DIRECT_START");
         ctx->qc_direct = direct_env != nullptr && std::strcmp(direct_env, "0") != 0;
         if (ctx->qc_direct) {
