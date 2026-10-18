@@ -118,3 +118,7 @@ but the design already fills most of the U50 (routed kernel: 56 % of the LUTs an
 budget, routing in the HBM-side SLR is the limit). A 32-engine variant did not route; the sources also compile with
 20 engines (`-DGEMVQC16_ENGINES=20`, 31 of 32 HBM ports), which has been checked in C simulation only and was never
 built into a bitstream.
+
+For Q4_0 the engines are also close to their compute limit: 16 × 128 products × 100 MHz = 205 GMAC/s, and the 4B
+model needs about 4.4 GMAC per token, about 88 % of the multipliers at the streaming floor. Levers, costs and a
+phased order for going faster without raising the clock are collected in [ROADMAP.md](ROADMAP.md).

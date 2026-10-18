@@ -64,7 +64,8 @@ llama.cpp  ──►  ggml backend "XRT" (llama.cpp/overlay)  ──►  gemvqc1
 - **Everything else stays on the CPU:** the attention core (QK, softmax, V) of the 8 attention layers, the prompt,
   the sampler and tensors in unsupported formats.
 
-More detail: [docs/DESIGN.md](docs/DESIGN.md).
+More detail: [docs/DESIGN.md](docs/DESIGN.md). What could make it faster, and in which order:
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What you need
 
@@ -168,7 +169,7 @@ weight matrices; the four Q4_1 `ffn_down` tensors stay on the CPU.
 | `llama.cpp/overlay/` | the new ggml backend (`ggml-xrt`), copied into the llama.cpp tree |
 | `llama.cpp/patches/` | patches to llama.cpp, applied in order |
 | `scripts/` | `build_llama.sh`, `build_xclbin.sh` (the two build steps) and `benchmark.sh` |
-| `docs/` | build guide, design notes, benchmark images |
+| `docs/` | build guide, design notes, roadmap, benchmark images |
 
 ## License
 
