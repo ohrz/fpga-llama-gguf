@@ -113,7 +113,7 @@ Reasons for this sequence:
 
 1. C5 gives no gain alone. But each later step needs its area. A K1 build without C5 did not route.
 2. K1 needs one link and no change of function.
-3. Steps 3 and 4 change the kernel count. They need the area of step 2.
+3. Steps 3 and 4 change the kernel count. They need the area of step 1.
 4. P2 needs the multipliers that C2 or C5 makes free.
 
 ## 6. Risks and stop criteria
