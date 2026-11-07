@@ -44,7 +44,7 @@ decreased by 1 %. The table in the [README](../README.md#performance-history) sh
 
 | ID | Change | Estimated gain (4B Q4_0) | Cost |
 | --- | --- | --- | --- |
-| K1 | More timing margin in HLS (pipeline stages in the DeltaNet units and the command loop) | +5 % (clock 100 MHz) | one link. A build is in progress |
+| K1 | More timing margin in HLS (pipeline stages in the DeltaNet units and the command loop) | +5 % (clock 100 MHz) | one link. A test build without C5 did not route: 2 % more LUTs, congestion level 7 |
 | A5 | DeltaNet units with 16 lanes | −2 to −3 ms for each token | +560 DSPs. Possible only after C5 |
 | A6 | Activations in the chip (URAM) for norms and element-wise passes | −1 to −2 ms for each token | URAM is 70 % free |
 | A4 | `ssm_alpha`, `ssm_beta` and K/V projections in the qkv group | less than 0.5 ms | small |
@@ -100,8 +100,8 @@ uses are possible:
 | Step | Content | 4B Q4_0 | 4B Q8_0 | 9B Q4_0 |
 | --- | --- | --- | --- | --- |
 | current | 20 engines, 94.8 MHz (measured) | 30.7 | 21.1 | 19.3 |
-| 1 clock | K1 | ≈ 32 | ≈ 22 | ≈ 20 |
-| 2 area | C5 area reduction, target ≤ 3300 DSPs | as step 1 | as step 1 | as step 1 |
+| 1 area | C5 area reduction, target ≤ 3300 DSPs | as current | as current | as current |
+| 2 clock | K1 | ≈ 32 | ≈ 22 | ≈ 20 |
 | 3 split | engine kernel and vector kernel, A5 | ≈ 35 | ≈ 23 | ≈ 21 |
 | 4 one launch | B1 attention on the card, B2 | ≈ 38–40 | ≈ 24–25 | ≈ 23–24 |
 | 5 batch | P2 batch path, then speculative decode or more sequences | – | – | – |
@@ -111,8 +111,8 @@ one term.
 
 Reasons for this sequence:
 
-1. K1 needs one link and no change of function.
-2. C5 gives no gain alone. But each later step needs its area.
+1. C5 gives no gain alone. But each later step needs its area. A K1 build without C5 did not route.
+2. K1 needs one link and no change of function.
 3. Steps 3 and 4 change the kernel count. They need the area of step 2.
 4. P2 needs the multipliers that C2 or C5 makes free.
 
