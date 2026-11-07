@@ -21,6 +21,25 @@ uint32_t float_to_bits(float value) {
     return c.bits;
 }
 
+float bits_to_float(uint32_t bits) {
+#pragma HLS INLINE
+    union { uint32_t bits; float value; } c;
+    c.bits = bits;
+    return c.value;
+}
+
+// roundf(|v|) from the FP32 bits of v (|v| < 2^23, half away from zero): exact like truncating, subtracting and
+// comparing in FP32, without a float-to-int, an int-to-float and a subtraction per lane.
+uint32_t round_magnitude(uint32_t bits) {
+#pragma HLS INLINE
+    const uint32_t exponent = (bits >> 23) & 0xffU;
+    if (exponent < 126U) return 0U;  // |v| < 0.5
+    const uint32_t shift = 150U - exponent, mantissa = (bits & 0x7fffffU) | 0x800000U;
+    const uint32_t q = mantissa >> shift, rem = mantissa & ((uint32_t(1) << shift) - 1U);
+    const uint32_t half = uint32_t(1) << (shift - 1U);
+    return q + (rem >= half ? 1U : 0U);
+}
+
 ap_uint<16> fp32_to_fp16(float value) {
 #pragma HLS INLINE
     const uint32_t bits = float_to_bits(value);
@@ -89,14 +108,14 @@ void quantize_x_impl(const ap_uint<512> * x, unsigned blocks, xq_word (*local_xq
 #pragma HLS PIPELINE II=2
         float value[32];
 #pragma HLS ARRAY_PARTITION variable=value complete
-        float magnitude[32];
+        uint32_t magnitude[32];  // fabsf as FP32 bits: for finite values the integer order is the float order
 #pragma HLS ARRAY_PARTITION variable=magnitude complete
         const ap_uint<512> low = SRC_STREAM ? xin->read() : x[block * 2U];
         const ap_uint<512> high = SRC_STREAM ? xin->read() : x[block * 2U + 1U];
         for (unsigned j = 0; j < 32; ++j) {
 #pragma HLS UNROLL
             value[j] = word_lane_float(j < 16 ? low : high, j & 15U);
-            magnitude[j] = value[j] < 0.0f ? -value[j] : value[j];
+            magnitude[j] = float_to_bits(value[j]) & 0x7fffffffU;
         }
         for (unsigned width = 16; width >= 1; width >>= 1) {
 #pragma HLS UNROLL
@@ -105,17 +124,16 @@ void quantize_x_impl(const ap_uint<512> * x, unsigned blocks, xq_word (*local_xq
                 magnitude[i] = magnitude[2 * i] > magnitude[2 * i + 1] ? magnitude[2 * i] : magnitude[2 * i + 1];
             }
         }
-        const float scale = magnitude[0] / 127.0f;
+        const float scale = bits_to_float(magnitude[0]) / 127.0f;
         const float reciprocal = scale != 0.0f ? 1.0f / scale : 0.0f;
         ap_uint<256> packed = 0;
         int quant_sum = 0;
         for (unsigned j = 0; j < 32; ++j) {
 #pragma HLS UNROLL
-            // Exact roundf(): truncate, then step away from zero when the remainder is at least one half.
-            const float scaled = value[j] * reciprocal;
-            const int32_t truncated = int32_t(scaled);
-            const float remainder = scaled - float(truncated);
-            const int8_t rounded = int8_t(truncated + (remainder >= 0.5f ? 1 : (remainder <= -0.5f ? -1 : 0)));
+            // roundf(): |x / scale| <= 127 (plus rounding), half away from zero.
+            const uint32_t scaled = float_to_bits(value[j] * reciprocal);
+            const int magnitude_q = int(round_magnitude(scaled));
+            const int8_t rounded = int8_t((scaled >> 31) != 0U ? -magnitude_q : magnitude_q);
             packed.range(j * 8 + 7, j * 8) = ap_uint<8>(rounded);
             quant_sum += rounded;
         }
@@ -250,9 +268,11 @@ void quantize_any_stream(hls::stream<ap_uint<512>> & xin, bool k_quant, unsigned
 // Source of the quantizer inside the gemvqc16 pass, on-chip only (act belongs to the store process there): the
 // deferred norm's row normalized on the fly from nx (the row) and nw (the weight), (x * scale) * w per lane (* w
 // only if weighted), the arithmetic of the RMSNORM opcode, so the quantizer sees exactly the values that opcode
-// would have written; or the raw words of x, copied to xbuf before the pass.
+// would have written; or the raw words of x, copied to xbuf before the pass; or (from_gate) the words of `gate` as
+// they come (the GDN step's output in the same pass).
 void x_source_onchip(const ap_uint<512> * nx, const ap_uint<512> * nw, const ap_uint<512> * xbuf, float scale,
-                     bool weighted, bool from_norm, unsigned words, hls::stream<ap_uint<512>> & out) {
+                     bool weighted, bool from_norm, bool from_gate, unsigned words, hls::stream<ap_uint<512>> & gate,
+                     hls::stream<ap_uint<512>> & out) {
     X_SOURCE_ONCHIP: for (unsigned i = 0; i < words; ++i) {
 #pragma HLS PIPELINE II=1
         const ap_uint<512> xw = nx[i], gw = nw[i], raw = xbuf[i];
@@ -262,7 +282,9 @@ void x_source_onchip(const ap_uint<512> * nx, const ap_uint<512> * nw, const ap_
             const float s = word_lane_float(xw, l) * scale;
             v.range(l * 32 + 31, l * 32) = float_to_bits(weighted ? s * word_lane_float(gw, l) : s);
         }
-        out.write(from_norm ? v : raw);
+        ap_uint<512> g = 0;
+        if (from_gate) g = gate.read();
+        out.write(from_gate ? g : (from_norm ? v : raw));
     }
 }
 
@@ -270,42 +292,42 @@ void x_source_onchip(const ap_uint<512> * nx, const ap_uint<512> * nw, const ap_
 // quantizer is a 1152-bit net with fan-out 16 that crosses the SLR boundary, and its routing delay (~9 ns)
 // limited the kernel clock. Here the words travel from engine to engine instead: stage e writes its own copy
 // and forwards the word through a registered stream, so every net is local and fans out to two sinks.
-void xcopy_forward(hls::stream<xmsg> & in, hls::stream<xmsg> & out, xq_word * local_xq, xs_word * local_xs,
-                   unsigned words) {
+// Each stage also hands every word to its engine through a shallow FIFO (local); the engine copies x into its own
+// buffer before it computes (compute_group in gemvqc16.cpp). A column-blocked GEMV sends x block by block, and the
+// FIFO holds the next block while the engine still computes the current one. (A stream of blocks would need two
+// 1024-bit-wide buffers per engine, ~17 RAMB36 more each; with one buffer HLS 2025.2 deadlocks.)
+void xcopy_forward(hls::stream<xmsg> & in, hls::stream<xmsg> & out, hls::stream<xmsg> & local, unsigned words) {
     XCOPY_FORWARD: for (unsigned i = 0; i < words; ++i) {
 #pragma HLS PIPELINE II=1
         const xmsg m = in.read();
-        local_xq[i] = m.q;
-        local_xs[i] = m.s;
+        local.write(m);
         out.write(m);
     }
 }
-
-void xcopy_last(hls::stream<xmsg> & in, xq_word * local_xq, xs_word * local_xs, unsigned words) {
+void xcopy_last(hls::stream<xmsg> & in, hls::stream<xmsg> & local, unsigned words) {
     XCOPY_LAST: for (unsigned i = 0; i < words; ++i) {
 #pragma HLS PIPELINE II=1
-        const xmsg m = in.read();
-        local_xq[i] = m.q;
-        local_xs[i] = m.s;
+        local.write(in.read());
     }
 }
-
-#define XCOPY_STAGE(n, words) xcopy_forward(link[n], link[n + 1], local_xq[n], local_xs[n], words)
-#define XCOPY_CHAIN(words)                                                                                        \
-    XCOPY_STAGE(0, words);   XCOPY_STAGE(1, words);   XCOPY_STAGE(2, words);   XCOPY_STAGE(3, words);            \
-    XCOPY_STAGE(4, words);   XCOPY_STAGE(5, words);   XCOPY_STAGE(6, words);   XCOPY_STAGE(7, words);            \
-    XCOPY_STAGE(8, words);   XCOPY_STAGE(9, words);   XCOPY_STAGE(10, words);  XCOPY_STAGE(11, words);           \
-    XCOPY_STAGE(12, words);  XCOPY_STAGE(13, words);  XCOPY_STAGE(14, words);                                    \
-    xcopy_last(link[15], local_xq[15], local_xs[15], words)
+#define XCOPY_STAGE(n, words) xcopy_forward(link[n], link[n + 1], xloc[n], words)
+#define XCOPY_CHAIN(words)                                                                                           \
+    XCOPY_STAGE(0, words);   XCOPY_STAGE(1, words);   XCOPY_STAGE(2, words);                                         \
+    XCOPY_STAGE(3, words);   XCOPY_STAGE(4, words);   XCOPY_STAGE(5, words);                                         \
+    XCOPY_STAGE(6, words);   XCOPY_STAGE(7, words);   XCOPY_STAGE(8, words);                                         \
+    XCOPY_STAGE(9, words);   XCOPY_STAGE(10, words);  XCOPY_STAGE(11, words);                                        \
+    XCOPY_STAGE(12, words);  XCOPY_STAGE(13, words);  XCOPY_STAGE(14, words);                                        \
+    xcopy_last(link[15], xloc[15], words)
 // The same chain for 20 engines (gemvqc16 with GEMVQC16_ENGINES 20).
-#define XCOPY_CHAIN20(words)                                                                                      \
-    XCOPY_STAGE(0, words);   XCOPY_STAGE(1, words);   XCOPY_STAGE(2, words);   XCOPY_STAGE(3, words);            \
-    XCOPY_STAGE(4, words);   XCOPY_STAGE(5, words);   XCOPY_STAGE(6, words);   XCOPY_STAGE(7, words);            \
-    XCOPY_STAGE(8, words);   XCOPY_STAGE(9, words);   XCOPY_STAGE(10, words);  XCOPY_STAGE(11, words);           \
-    XCOPY_STAGE(12, words);  XCOPY_STAGE(13, words);  XCOPY_STAGE(14, words);  XCOPY_STAGE(15, words);           \
-    XCOPY_STAGE(16, words);  XCOPY_STAGE(17, words);  XCOPY_STAGE(18, words);                                    \
-    xcopy_last(link[19], local_xq[19], local_xs[19], words)
-
+#define XCOPY_CHAIN20(words)                                                                                         \
+    XCOPY_STAGE(0, words);   XCOPY_STAGE(1, words);   XCOPY_STAGE(2, words);                                         \
+    XCOPY_STAGE(3, words);   XCOPY_STAGE(4, words);   XCOPY_STAGE(5, words);                                         \
+    XCOPY_STAGE(6, words);   XCOPY_STAGE(7, words);   XCOPY_STAGE(8, words);                                         \
+    XCOPY_STAGE(9, words);   XCOPY_STAGE(10, words);  XCOPY_STAGE(11, words);                                        \
+    XCOPY_STAGE(12, words);  XCOPY_STAGE(13, words);  XCOPY_STAGE(14, words);                                        \
+    XCOPY_STAGE(15, words);  XCOPY_STAGE(16, words);  XCOPY_STAGE(17, words);                                        \
+    XCOPY_STAGE(18, words);                                                                                          \
+    xcopy_last(link[19], xloc[19], words)
 unsigned blocks_per_word(unsigned format) {
 #pragma HLS INLINE
     return format == GEMVQ_Q8_0 ? 2U : 4U;
@@ -325,13 +347,6 @@ unsigned words_per_row(unsigned blocks_per_row, unsigned format) {
     if (format == GEMVQ_Q8_0) return full * 17U + (tail ? 1U + tail / 2U : 0U);
     const unsigned headers = header_words(format);
     return full * (headers + 8U) + (tail ? headers + tail / 4U : 0U);
-}
-
-float bits_to_float(uint32_t bits) {
-#pragma HLS INLINE
-    union { uint32_t bits; float value; } c;
-    c.bits = bits;
-    return c.value;
 }
 
 #if GEMVQ_INT_SCALE
@@ -437,9 +452,14 @@ acc_t scale_k_fixed(int s_sum, int m_sum, ap_uint<16> d_bits, ap_uint<16> dmin_b
 // Q4_0 nibble order. Q5_K: weight = nibble + 16 * high bit, scale and min per 32 weights. Q6_K: weight =
 // (nibble | 2 high bits << 4) - 32, int8 scale per 16 weights. The super-block's integer sums S = sum sc * (q . q8)
 // and M = sum m * (sum q8) give one FP32 term d * dx * S - dmin * dx * M after its second quant word.
+// A row may also be computed in column blocks (gemvqc16's column-blocked GEMV): one call per block, blocks_per_row
+// then counts the block's columns. The row sums of a block go to racc (indexed by the row of the call) and the next
+// block adds to them (not first); only the last block writes row_results. The fixed-point sum does not depend on the
+// order, so the results are the bits of the whole row in one call.
+constexpr unsigned MAX_BLOCKED_ROWS = 512;  // rows per engine of a column-blocked GEMV
 void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, const xs_word * local_xs,
                    unsigned format, unsigned word_count, unsigned blocks_per_row,
-                   hls::stream<float> & row_results) {
+                   hls::stream<float> & row_results, acc_t * racc = nullptr, bool first = true, bool last = true) {
     const bool q8 = format == GEMVQ_Q8_0, q4 = format == GEMVQ_Q4_0, q41 = GEMVQ_HAS_Q4_1 && format == GEMVQ_Q4_1;
     const bool k5 = format == GEMVQ_Q5_K, k6 = GEMVQ_HAS_Q6_K && format == GEMVQ_Q6_K, kq = k5 || k6;
     const unsigned bpw = blocks_per_word(format);
@@ -448,33 +468,27 @@ void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, 
     ap_uint<512> scales2 = 0;  // second header word: Q4_1 m word or Q6_K high-bit word
     // Packed Q6_K: one meta word per group of up to three super-blocks (meta j in bits 160j..160j+159); k6_slot is
     // the super-block's place in its group. A group starts with the meta word and the high-bit word, the other
-    // super-blocks with the high-bit word only.
-    ap_uint<512> meta3 = 0;
+    // super-blocks with the high-bit word only. The meta word stays in scales (Q6_K reads only its bits 159:0) and
+    // moves down by one meta at the high-bit word of the next super-block: a wire shift instead of a slot select.
     unsigned k6_slot = 0;
     unsigned header_left = headers;
     bool k_second = false;     // K-quants: the next quant word is the super-block's second one
     int k_s = 0, k_m = 0;      // K-quant integer sums of the first quant word
     unsigned block_in_row = 0;
     unsigned group_left = 0;
+    unsigned row = 0;  // row of this call (racc index)
     acc_t accumulator = 0;
     COMPUTE_WORDS: for (unsigned n = 0; n < word_count; ++n) {
 #pragma HLS PIPELINE II=1
+#pragma HLS DEPENDENCE variable=racc inter false
         const ap_uint<512> word = words.read();
         if (header_left != 0) {
-            if (k6) {
-                const ap_uint<512> m3 = header_left == 2U ? word : meta3;
-                if (header_left == 2U) {
-                    meta3 = word;
-                } else {
-                    scales2 = word;
-                    scales = k6_slot == 0 ? ap_uint<512>(m3.range(159, 0))
-                                          : (k6_slot == 1U ? ap_uint<512>(m3.range(319, 160)) : ap_uint<512>(m3.range(479, 320)));
-                }
-            } else if (header_left == headers) {
-                scales = word;
-            } else {
-                scales2 = word;
-            }
+            // One select per register: scales takes the word (first header word), moves to the next Q6_K meta, or
+            // holds; scales2 takes the word (second header word) or holds.
+            const bool first_word = header_left == headers;
+            const bool next_meta = k6 && !first_word && k6_slot != 0;
+            scales = first_word ? word : (next_meta ? ap_uint<512>(scales >> 160) : scales);
+            scales2 = first_word ? scales2 : word;
             const unsigned left = blocks_per_row - block_in_row;
             group_left = kq ? 8U : (left < 32U ? left : 32U);
             --header_left;
@@ -610,7 +624,8 @@ void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, 
                 k_second = !k_second;
             }
             // Only this add is in the recurrence; everything before it is registered.
-            const acc_t next = (block_in_row == 0 ? acc_t(0) : accumulator) + stage_reg(word_term);
+            const acc_t start = first ? acc_t(0) : racc[row];
+            const acc_t next = (block_in_row == 0 ? start : accumulator) + stage_reg(word_term);
 #else
             float word_term = (lane_term[0] + lane_term[1]) + (lane_term[2] + lane_term[3]);
             if (kq) {
@@ -624,7 +639,7 @@ void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, 
                 k_m = m_sum;
                 k_second = !k_second;
             }
-            const acc_t base = block_in_row == 0 ? acc_t(0) : accumulator;
+            const acc_t base = block_in_row == 0 ? (first ? acc_t(0) : racc[row]) : accumulator;
             const acc_t next = base + float_to_fixed(word_term);
 #endif
             accumulator = next;
@@ -637,7 +652,12 @@ void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, 
                 header_left = k6 && !group_end ? 1U : headers;
             }
             if (block_in_row == blocks_per_row) {
-                row_results.write(fixed_to_float(next));
+                if (last) {
+                    row_results.write(fixed_to_float(next));
+                } else {
+                    racc[row] = next;
+                }
+                ++row;
                 block_in_row = 0;
             }
         }

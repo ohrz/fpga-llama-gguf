@@ -32,10 +32,11 @@ constexpr unsigned UROWS = S / U;          // rows of one head handled by one un
 constexpr unsigned MAX_HEADS = 32;          // the state buffers hold one layer of up to 32 value heads
 constexpr unsigned BUF_WORDS = MAX_HEADS * UROWS * SW;  // words per unit and buffer (one port's share of a layer)
 #ifndef GEMVQC_GATED_LANES
-#define GEMVQC_GATED_LANES 4
+#define GEMVQC_GATED_LANES 1
 #endif
-constexpr unsigned GATED_LANES = GEMVQC_GATED_LANES;  // lanes of the gated output per clock (4, 8 or 16)
-static_assert(GATED_LANES == 4 || GATED_LANES == 8 || GATED_LANES == 16, "GATED_LANES must divide a word");
+// Lanes of the gated output per clock: one word in 16 clocks keeps up with the step (512 clocks per head and 8 words).
+constexpr unsigned GATED_LANES = GEMVQC_GATED_LANES;
+static_assert(16 % GATED_LANES == 0, "GATED_LANES must divide a word");
 static_assert(16 % U == 0, "state units must divide 16");
 #ifndef GEMVQC_GDN_LANES
 #define GEMVQC_GDN_LANES 8
@@ -65,6 +66,8 @@ struct gdn_pass {
     unsigned pf_start, pf_count;
     unsigned hv, hk;
     float scale;
+    bool gated;     // y leaves through the gated norm (gdn_gate)
+    float rms_eps;
 };
 
 // Stage A of one unit: prefetch, then decay the state row, dot with k, emit the decayed words and delta for stage B.
@@ -125,16 +128,17 @@ void stage_a(const vword * st_rd, vword * st, gdn_pass pass, const vword * kbuf,
     }
 }
 
-// Stage B of one unit: write-back, then S' = x + k * delta into the output buffer, y_j = (S' . q) * scale.
+// Stage B of one unit: write-back, then S' = x + k * delta into the output buffer, y_j = (S' . q) * scale into ys
+// (the unit's rows of each head in order).
 void stage_b(vword * st_wr, vword * st, gdn_pass pass, const vword * kbuf, const vword * qbuf,
-             hls::stream<vword> & xs, hls::stream<float> & deltas, float * yloc) {
+             hls::stream<vword> & xs, hls::stream<float> & deltas, hls::stream<float> & ys) {
     STATE_WB: for (unsigned i = 0; i < pass.wb_count; ++i) {
 #pragma HLS PIPELINE II=1
         st_wr[pass.wb_word + pass.wb_start + i] = st[pass.wb_start + i];
     }
     float part[SW];
 #pragma HLS ARRAY_PARTITION variable=part complete
-    unsigned w = 0, row = 0, m = 0, kh = 0;
+    unsigned w = 0, m = 0, kh = 0;
     float delta = 0.0f, lo = 0.0f;
     vword x = 0, kw = 0, qw = 0, out = 0;
     const unsigned hk = pass.hk, total = pass.hv * UROWS * SW * GH;
@@ -167,8 +171,7 @@ void stage_b(vword * st_wr, vword * st, gdn_pass pass, const vword * kbuf, const
             st[c / GH] = out;
             part[w] = sum;
             if (w == SW - 1U) {
-                yloc[row] = tree8(part) * scale;
-                ++row;
+                ys.write(tree8(part) * scale);
                 w = 0;
                 if (m == UROWS - 1U) {
                     m = 0;
@@ -184,10 +187,10 @@ void stage_b(vword * st_wr, vword * st, gdn_pass pass, const vword * kbuf, const
 }
 
 // Both stages of unit u inside a dataflow region that has the state ports, the buffers in/out, the step inputs
-// ka, kb, qb, v, decay, beta, the result y, the streams xs/ds and the pass description `pass`.
+// ka, kb, qb, v, decay, beta, the streams xs/ds/ys and the pass description `pass`.
 #define GEMVQC_GDN_UNIT(u)                                                                                        \
     gemvqc_gdn::stage_a(st##u##_rd, in[u], pass, ka[u], v[u], decay[u], beta[u], u, xs[u], ds[u]);              \
-    gemvqc_gdn::stage_b(st##u##_wr, out[u], pass, kb[u], qb[u], xs[u], ds[u], y[u])
+    gemvqc_gdn::stage_b(st##u##_wr, out[u], pass, kb[u], qb[u], xs[u], ds[u], ys[u])
 static_assert(U == 4, "the GEMV pass of gemvqc16 is written out for four state ports");
 
 // Per-head scales of `heads` rows of 128 floats in buf (8 words each), exactly as the RMSNORM opcode (rownorm) does
@@ -278,54 +281,67 @@ void gdn_load(const vword * act, unsigned hv, unsigned hk, unsigned q_off, unsig
 }
 static_assert(4 * ((MAX_HEADS + 15) / 16) <= 64, "the gate words must fit below the q/k words in buf_a");
 
-// y (H_v * 128 floats) after the pass. Word (h, jw) holds rows j = 16 jw + l; row j came from unit j % U = l % U at
-// local row h * UROWS + j / U. gated: instead of y, out = (y * scale_h) * w * silu(z) per head h (the RMSNORM opcode
-// with weight w (128 floats) and rms_eps, then the SILU_MUL opcode with z), four lanes per cycle.
-// Word i of y (head i / SW, rows 16 (i % SW) + l).
-vword y_word(float y[U][MAX_HEADS * UROWS], unsigned i) {
-#pragma HLS INLINE
-    const unsigned h = i / SW, jw = i % SW;
-    vword out = 0;
-    for (unsigned l = 0; l < 16; ++l) {
+// The step's y as words, head by head, while the step runs: unit u gives rows j = u (mod U) of every head in order,
+// so four values per clock fill a word's lanes 4 (j % 16 / 4) + u. gated: instead of y, per head
+// (y * scale_h) * w * silu(z) with scale_h = 1 / sqrt(mean(y^2) + rms_eps) and w (128 floats) in wbuf, z (hv * 128
+// floats) in zbuf: the RMSNORM opcode with weight, then the SILU_MUL opcode. The squares are summed while the
+// values arrive, four per clock, in the order of sumsq16 (tree16 = pairs of four-lane sums), and row_scale gets the
+// word sums as head_scales passes them, so scale_h has the bits of the RMSNORM opcode. Every word goes to gy (for
+// act) and, with to_x, to gx (the x of the pass's GEMV).
+void gdn_gate(hls::stream<float> ys[U], unsigned hv, bool gated, float rms_eps, const vword * zbuf,
+              const vword * wbuf, bool to_x, hls::stream<vword> & gy, hls::stream<vword> & gx) {
+    vword head[SW];
+    float part[SW];
+#pragma HLS ARRAY_PARTITION variable=part complete
+    GDN_GATE_HEADS: for (unsigned h = 0; h < hv; ++h) {
+        vword cur = 0;
+        float q4[4];  // four-lane sums of the current word
+#pragma HLS ARRAY_PARTITION variable=q4 complete
+        GDN_GATE_COLLECT: for (unsigned m = 0; m < UROWS; ++m) {
+#pragma HLS PIPELINE II=1
+            float sq[U];
+#pragma HLS ARRAY_PARTITION variable=sq complete
+            for (unsigned u = 0; u < U; ++u) {
 #pragma HLS UNROLL
-        set_lane(out, l, y[l % U][h * UROWS + (jw * 16U + l) / U]);
-    }
-    return out;
-}
-
-void gdn_store(vword * act, unsigned hv, unsigned y_off, float y[U][MAX_HEADS * UROWS], bool gated, float rms_eps,
-               unsigned w_off, unsigned z_off, vword * buf_a, vword * buf_b, vword * buf_c) {
-    const unsigned vwords = hv * SW;
-    // Two loops with unconditional stores: one loop that writes act only on some path got a write burst whose
-    // length follows the other path, and the RTL hung in co-simulation.
-    if (!gated) {
-        GDN_STORE_Y: for (unsigned i = 0; i < vwords; ++i) {
-#pragma HLS PIPELINE II=1
-            act[y_off / 16U + i] = y_word(y, i);
+                const float yv = ys[u].read();
+                sq[u] = yv * yv;
+                cur = (cur >> 32) | (vword(gemvqc_ops::lane_bits(yv)) << 480);
+            }
+            q4[m % 4U] = (sq[0] + sq[1]) + (sq[2] + sq[3]);
+            if (m % 4U == 3U) {
+                head[m / 4U] = cur;
+                part[m / 4U] = (q4[0] + q4[1]) + (q4[2] + q4[3]);
+            }
         }
-        return;
-    }
-    GDN_STORE_YB: for (unsigned i = 0; i < vwords; ++i) {
+        const float hs = gemvqc_ops::row_scale(part[7], part[6], part[5], part[4], part[3], part[2], part[1], part[0],
+                                               S, rms_eps, false);
+        constexpr unsigned GL = GATED_LANES, GQ = 16U / GL;
+        // The lanes move through shift registers (no lane selected by a variable index).
+        vword raw = 0, x = 0, z = 0, g = 0, out = 0;
+        GDN_GATE_APPLY: for (unsigned j = 0; j < SW * GQ; ++j) {
 #pragma HLS PIPELINE II=1
-        buf_a[i] = y_word(y, i);
-    }
-    float hs[MAX_HEADS];
-    head_scales(buf_a, hv, rms_eps, false, hs);
-    gemvqc_ops::load_words(act + z_off / 16U, vwords, buf_b);
-    gemvqc_ops::load_words(act + w_off / 16U, SW, buf_c);
-    constexpr unsigned GL = GATED_LANES, GQ = 16U / GL;
-    vword out = 0;
-    GDN_GATED: for (unsigned j = 0; j < vwords * GQ; ++j) {
-#pragma HLS PIPELINE II=1
-        const unsigned i = j / GQ, q = j % GQ;
-        const vword x = buf_a[i], z = buf_b[i], g = buf_c[i % SW];
-        for (unsigned l = 0; l < GL; ++l) {
+            const unsigned i = j / GQ, q = j % GQ;
+            if (q == 0) {
+                raw = head[i];
+                x = raw;
+                z = zbuf[h * SW + i];
+                g = wbuf[i];
+            }
+            for (unsigned l = 0; l < GL; ++l) {
 #pragma HLS UNROLL
-            const unsigned lane = q * GL + l;
-            const float nv = gemvqc_ops::norm_apply_f(word_lane_float(x, lane), word_lane_float(g, lane), hs[i / SW], true);
-            set_lane(out, lane, gemvqc_ops::silu_mul_f(word_lane_float(z, lane), nv));
+                const float nv = gemvqc_ops::norm_apply_f(word_lane_float(x, l), word_lane_float(g, l), hs, true);
+                const float o = gemvqc_ops::silu_mul_f(word_lane_float(z, l), nv);
+                out = (out >> 32) | (vword(gemvqc_ops::lane_bits(o)) << 480);
+            }
+            x >>= 32 * GL;
+            z >>= 32 * GL;
+            g >>= 32 * GL;
+            if (q == GQ - 1U) {
+                const vword o = gated ? out : raw;
+                gy.write(o);
+                if (to_x) gx.write(o);
+            }
         }
-        if (q == GQ - 1U) act[y_off / 16U + i] = out;
     }
 }
 

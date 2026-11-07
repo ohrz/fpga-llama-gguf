@@ -24,6 +24,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -145,6 +146,21 @@ static constexpr size_t XRT_QC_RES_BASE = XRT_QC_ACT_BYTES / sizeof(float);  // 
 static constexpr unsigned XRT_QC_STATE_PORTS = 4;
 static constexpr size_t XRT_QC_STATE_BYTES = 64ULL << 20;
 static constexpr size_t XRT_QC_STATE_ROW = 512;
+// GGML_XRT_TRACE=1 (diagnostic, kernels with feature bit 14): every list starts with a TRACE command whose log goes to
+// the top of the activation buffer (kept free of resident data); the cycles per command kind are summed up and
+// printed at exit. Lists get one command less while tracing.
+static constexpr unsigned XRT_QC_TRACE_ENTRIES = 512;
+static constexpr size_t XRT_QC_TRACE_FLOATS = 16 * (1 + XRT_QC_TRACE_ENTRIES / 8);
+static constexpr size_t XRT_QC_TRACE_OFF = XRT_QC_ACT_BYTES_GDN / sizeof(float) - XRT_QC_TRACE_FLOATS;
+
+static bool xrt_trace_requested() {
+    static const bool on = std::getenv("GGML_XRT_TRACE") != nullptr;
+    return on;
+}
+
+static size_t xrt_qc_cmd_bytes() {
+    return XRT_QC_CMD_BYTES - (xrt_trace_requested() ? XRT_QC_CMD_WORDS * sizeof(unsigned) : 0);
+}
 
 // A buffer object on the card, or plain host memory when the kernel runs as its C++ model (GGML_XRT_EMULATE=1).
 struct xrt_qc_mem {
@@ -226,14 +242,21 @@ struct xrt_backend_context {
     xrt_qc_mem qc_cmd_bo;
     bool qc_emulate = false;  // kernel runs as the HLS C++ model on host memory
     xrt::run qc_run;          // all arguments fixed except the command count
-    // GGML_XRT_DIRECT_START=1: the CU is started through its control registers (needs ert_disable=1), ~6 us per
-    // launch instead of ~190 us through XRT; the argument registers are written once.
+    // Direct start (default with ert_disable=1, GGML_XRT_DIRECT_START=0 turns it off): the CU is started through its
+    // control registers, ~6 us per launch instead of ~190 us through XRT; the argument registers are written once.
     bool qc_direct = false;
     xrt::ip qc_ip;
     uint32_t qc_ncmds_reg = 0;  // register offset of n_cmds
     uint32_t qc_features = 0;   // feature bits of the loaded kernel (0: Q4_0/Q8_0 only)
+    bool qc_z_early = false;    // the kernel reads z when a gated GDN step starts (GDN_OUT kernels, even if masked)
     size_t qc_used = 0;         // bytes used in every engine arena; the next tensor starts here in all of them
     std::unordered_map<xrt_weight_key, uint64_t, xrt_weight_key_hash> qc_offsets;  // word offset per tensor
+    std::unordered_map<xrt_weight_key, uint64_t, xrt_weight_key_hash> qc_offsets_blocked;  // column-blocked layout
+    // Output head on single-channel arenas (xrt_active_qc_head_fits): bytes per engine of the GEMV weights accepted
+    // so far, each with its larger layout, and the decision, taken once.
+    std::unordered_map<const ggml_tensor *, size_t> qc_planned;
+    size_t qc_planned_bytes = 0;
+    int qc_head = -1;  // -1 open, 0 on the CPU, 1 on the card
     // DeltaNet opcodes (kernel with four state ports): recurrent states live on the card, see XRT_RS buffers.
     bool qc_gdn = false;
     std::vector<xrt_qc_mem> qc_state_bos;                  // one per state port, 512-byte row r on bo[r % 4]
@@ -304,12 +327,10 @@ static xrt_device_context * xrt_device_ctx(ggml_backend_dev_t dev) {
         : nullptr;
 }
 
-// Largest GEMV the active kernel accepts: the output head only when its weights fit into the arenas.
+// Largest GEMV the active kernel accepts; the output head also has to fit (xrt_active_qc_head_fits).
 static int64_t xrt_active_qc_max_rows() {
     std::lock_guard<std::mutex> lock(xrt_device_context_inst.mutex);
-    const xrt_backend_context * ctx = xrt_device_context_inst.active_backend;
-    const bool large = ctx != nullptr && ctx->qc_arena_bytes >= XRT_QC_ARENA_BYTES_PAIR;
-    return large ? XRT_QC_MAX_ROWS_LARGE : XRT_QC_MAX_ROWS_SMALL;
+    return xrt_device_context_inst.active_backend != nullptr ? XRT_QC_MAX_ROWS_LARGE : XRT_QC_MAX_ROWS_SMALL;
 }
 
 static bool xrt_active_qc_mode() {
@@ -333,6 +354,13 @@ static constexpr uint32_t XRT_QC_FEATURE_GDN_GATES = 1024U; // GDN computes its 
 static constexpr uint32_t XRT_QC_FEATURE_STRIDED = 2048U;   // strided rows in RMSNORM and UNARY, UNARY copy
 static constexpr uint32_t XRT_QC_FEATURE_ROPE = 4096U;      // ROPE opcode (rope cache from the host)
 static constexpr uint32_t XRT_QC_FEATURE_Q6K_PACKED = 8192U; // Q6_K in the packed word layout (gemvqw_layout.h)
+static constexpr uint32_t XRT_QC_FEATURE_TRACE = 16384U;     // TRACE opcode (cycle trace of a launch)
+// GEMV on the GDN step's output in the step's pass (column-blocked weights); the gated norm reads z when the step
+// starts, so z is no longer the step's late GEMV.
+static constexpr uint32_t XRT_QC_FEATURE_GDN_OUT = 32768U;
+// Second feature word (GEMVQC_FEATURES2: marker 0x6B52 in the high half), kept in the high half of qc_features.
+static constexpr uint32_t XRT_QC_FEATURE2_MARK = 0x6B520000U;
+static constexpr uint32_t XRT_QC_FEATURE_SIGMOID_MUL = 1U << 16;  // SILU_MUL flag 1: sigmoid(g) * u, strided g
 
 static uint32_t xrt_active_qc_features() {
     std::lock_guard<std::mutex> lock(xrt_device_context_inst.mutex);
@@ -484,7 +512,7 @@ static enum ggml_status xrt_rs_buffer_init_tensor(ggml_backend_buffer_t buffer, 
         rs->rows_end = owner->qc_state_rows_used;
     } else {
         const size_t floats = (t.bytes / sizeof(float) + 15U) / 16U * 16U;
-        if (XRT_QC_RES_BASE + owner->qc_resident_used + floats > XRT_QC_ACT_BYTES_GDN / sizeof(float)) {
+        if (XRT_QC_RES_BASE + owner->qc_resident_used + floats > XRT_QC_TRACE_OFF) {
             fprintf(stderr, "XRT: resident act region full at %s\n", tensor->name);
             return GGML_STATUS_ALLOC_FAILED;
         }
@@ -599,6 +627,7 @@ static void ggml_backend_xrt_free(ggml_backend_t backend) {
         fprintf(stderr, "XRT-DEBUG: backend free context=%p\n", static_cast<void *>(ctx));
     }
     ctx->qc_offsets.clear();
+    ctx->qc_offsets_blocked.clear();
     ctx->qc_weight_bos.clear();
     {
         std::lock_guard<std::mutex> lock(xrt_device_context_inst.mutex);
@@ -623,12 +652,71 @@ static xrt_weight_key xrt_make_weight_key(const ggml_tensor * weights, size_t by
     return key;
 }
 
+// The CPU repack buffer keeps the weights in the layout of the CPU's batched GEMM, so prompts stay as fast as on
+// the CPU alone. On x86 ggml repacks only Q4_0 (AVX2: block_q4_0x8, rows a multiple of 8) among the formats of the
+// card; tensors of that buffer in any other layout stay on the CPU.
+static bool xrt_buft_is_cpu_repack(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && std::strcmp(ggml_backend_buft_name(buft), "CPU_REPACK") == 0;
+}
+
+static bool xrt_is_cpu_repack(const ggml_tensor * t) {
+    return t->buffer != nullptr && xrt_buft_is_cpu_repack(t->buffer->buft);
+}
+
+static bool xrt_repack_layout_known(const ggml_tensor * t) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return t->type == GGML_TYPE_Q4_0 && t->ne[1] % 8 == 0 && ggml_nrows(t) == t->ne[1];
+#else
+    (void) t;
+    return false;
+#endif
+}
+
+// Weight rows in GGUF layout: the tensor data itself, or for a CPU repack tensor a lossless copy back from
+// block_q4_0x8 (8 fp16 scales, then 16 chunks of 8 bytes: chunk j holds bytes 8*(j/8).. of the quants of row j%8,
+// each byte XOR 0x88) to block_q4_0 (fp16 scale, 16 bytes of quants).
+struct xrt_gguf_rows {
+    std::vector<uint8_t> copy;
+    const uint8_t * data = nullptr;
+};
+
+static xrt_gguf_rows xrt_gguf(const ggml_tensor * w) {
+    xrt_gguf_rows r;
+    if (!xrt_is_cpu_repack(w)) {
+        r.data = static_cast<const uint8_t *>(w->data);
+        return r;
+    }
+    GGML_ASSERT(xrt_repack_layout_known(w));
+    constexpr size_t Q4_0_BYTES = 18, Q4_0X8_BYTES = 144;
+    const size_t blocks = size_t(w->ne[0]) / 32, rows = size_t(w->ne[1]);
+    const auto * src = static_cast<const uint8_t *>(w->data);
+    r.copy.resize(rows * blocks * Q4_0_BYTES);
+    for (size_t g = 0; g < rows / 8; ++g) {
+        for (size_t x = 0; x < blocks; ++x) {
+            const uint8_t * in = src + (g * blocks + x) * Q4_0X8_BYTES;
+            for (size_t i = 0; i < 8; ++i) {
+                uint8_t * out = r.copy.data() + ((g * 8 + i) * blocks + x) * Q4_0_BYTES;
+                std::memcpy(out, in + 2 * i, 2);
+                for (size_t h = 0; h < 2; ++h) {
+                    for (size_t k = 0; k < 8; ++k) {
+                        out[2 + 8 * h + k] = in[16 + 8 * (8 * h + i) + k] ^ 0x88;
+                    }
+                }
+            }
+        }
+    }
+    r.data = r.copy.data();
+    return r;
+}
+
+static bool xrt_active_qc_head_fits(const ggml_tensor * w, const ggml_tensor * x, unsigned format);
+
 // Single-vector MUL_MAT accepted by gemvqc16 (contiguous GGUF rows): Q4_0/Q8_0 (and Q4_1 on kernels with that
 // feature) with cols a multiple of 128, Q5_K/Q6_K (kernels with those features) with cols a multiple of 256.
 static bool is_single_vector_gemvqc(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const int64_t max_rows = xrt_active_qc_max_rows();
     const unsigned format = xrt_qc_format(src0->type, xrt_active_qc_features());
-    if (format == 0) {
+    if (format == 0 || (xrt_is_cpu_repack(src0) && !xrt_repack_layout_known(src0))) {
         return false;
     }
     const int64_t cols = src0->ne[0];
@@ -639,20 +727,22 @@ static bool is_single_vector_gemvqc(const ggml_tensor * src0, const ggml_tensor 
            src1->ne[0] == cols && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
            dst->ne[0] == rows && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
            src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] == ggml_row_size(src0->type, cols) &&
-           src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
+           src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) && xrt_active_qc_head_fits(src0, src1, format);
 }
 
-// Repacks and uploads a weight tensor once; returns its word offset, common to all engine arenas.
-static uint64_t xrt_qc_weight_offset(xrt_backend_context * ctx, const ggml_tensor * weights) {
+// Repacks and uploads a weight tensor once; returns its word offset, common to all engine arenas. block_cols: the
+// column-blocked layout (GDN_WITH_OUT GEMV), kept apart from the plain one.
+static uint64_t xrt_qc_weight_offset(xrt_backend_context * ctx, const ggml_tensor * weights, unsigned block_cols = 0) {
     const xrt_weight_key key = xrt_make_weight_key(weights, ggml_nbytes(weights));
-    if (const auto it = ctx->qc_offsets.find(key); it != ctx->qc_offsets.end()) {
+    auto & offsets = block_cols != 0 ? ctx->qc_offsets_blocked : ctx->qc_offsets;
+    if (const auto it = offsets.find(key); it != offsets.end()) {
         return it->second;
     }
     const unsigned rows = unsigned(weights->ne[1]), cols = unsigned(weights->ne[0]);
     const unsigned format = xrt_qc_format(weights->type, ctx->qc_features);
     const bool q6k_packed = (ctx->qc_features & XRT_QC_FEATURE_Q6K_PACKED) != 0;
-    const auto arenas = gemvqw_layout::repack(static_cast<const uint8_t *>(weights->data), rows, cols, format,
-                                              ctx->qc_engines, q6k_packed);
+    const auto arenas = gemvqw_layout::repack(xrt_gguf(weights).data, rows, cols, format, ctx->qc_engines, q6k_packed,
+                                              block_cols);
     size_t need = 0;
     for (const auto & arena : arenas) need = std::max(need, align_xrt_word(arena.size()));
     if (ctx->qc_used + need > ctx->qc_arena_bytes) {
@@ -665,10 +755,10 @@ static uint64_t xrt_qc_weight_offset(xrt_backend_context * ctx, const ggml_tenso
     }
     const uint64_t offset_words = ctx->qc_used / XRT_WORD_BYTES;
     ctx->qc_used += need;
-    ctx->qc_offsets.emplace(key, offset_words);
+    offsets.emplace(key, offset_words);
     if (xrt_debug_enabled()) {
-        fprintf(stderr, "XRT-DEBUG: gemvqc16 upload %s fmt=%u rows=%u cols=%u offset_words=%llu used=%.1f MiB/engine\n",
-                weights->name, format, rows, cols, (unsigned long long) offset_words,
+        fprintf(stderr, "XRT-DEBUG: gemvqc16 upload %s fmt=%u rows=%u cols=%u%s offset_words=%llu used=%.1f MiB/engine\n",
+                weights->name, format, rows, cols, block_cols != 0 ? " (column-blocked)" : "", (unsigned long long) offset_words,
                 double(ctx->qc_used) / (1024.0 * 1024.0));
     }
     return offset_words;
@@ -716,8 +806,43 @@ static bool xrt_qc_supports(const ggml_tensor * op) {
 
 static constexpr unsigned XRT_QC_OP_MUL = 5, XRT_QC_OP_UNARY = 6, XRT_QC_OP_GDN = 7, XRT_QC_OP_CONV = 8;
 static constexpr unsigned XRT_QC_OP_STATE_LOAD = 9, XRT_QC_GEMV_SWIGLU = 0x100, XRT_QC_GDN_WITH_GEMV = 1;
+static constexpr unsigned XRT_QC_OP_TRACE = 11;
 static constexpr unsigned XRT_QC_GEMV_CONV = 0x200, XRT_QC_GEMV_ADD = 0x400, XRT_QC_GDN_L2_QK = 2, XRT_QC_GDN_GATED = 4;
-static constexpr unsigned XRT_QC_GDN_GATES = 8;
+static constexpr unsigned XRT_QC_GDN_GATES = 8, XRT_QC_GDN_WITH_OUT = 16;
+static constexpr unsigned XRT_QC_OUT_BLOCK = 256, XRT_QC_OUT_MAX_ROWS = 512;  // column block, rows per engine
+
+// Channel-pair arenas hold every model with its output head. Single-channel arenas (20 engines) take the head only
+// if it fits next to the other GEMV weights. supports_op meets those first in a decode graph and adds each here with
+// its larger layout: column-blocked when x may be a gated norm's output (MUL by SILU, the ssm_out input), else plain.
+// The head is decided once, when it comes after them; until then (e.g. a prompt graph, whose layers run on the CPU)
+// it stays on the CPU.
+static bool xrt_active_qc_head_fits(const ggml_tensor * w, const ggml_tensor * x, unsigned format) {
+    std::lock_guard<std::mutex> lock(xrt_device_context_inst.mutex);
+    xrt_backend_context * ctx = xrt_device_context_inst.active_backend;
+    if (ctx == nullptr || ctx->qc_arena_bytes >= XRT_QC_ARENA_BYTES_PAIR) return true;
+    const unsigned rows = unsigned(w->ne[1]), cols = unsigned(w->ne[0]), engines = ctx->qc_engines;
+    const bool packed = (ctx->qc_features & XRT_QC_FEATURE_Q6K_PACKED) != 0;
+    unsigned words = gemvqw_layout::words_per_row(cols, format, packed);
+    while (x->op == GGML_OP_RESHAPE || x->op == GGML_OP_VIEW) x = x->src[0];
+    const bool gated_norm = x->op == GGML_OP_MUL && x->src[1] != nullptr && x->src[1]->op == GGML_OP_UNARY &&
+                            ggml_get_unary_op(x->src[1]) == GGML_UNARY_OP_SILU;
+    if ((ctx->qc_features & XRT_QC_FEATURE_GDN_OUT) && gated_norm && cols % XRT_QC_OUT_BLOCK == 0 &&
+        rows <= XRT_QC_OUT_MAX_ROWS * engines) {
+        words = std::max(words, gemvqw_layout::words_per_row_blocked(cols, format, XRT_QC_OUT_BLOCK, packed));
+    }
+    const size_t need = align_xrt_word(size_t((rows + engines - 1) / engines) * words * XRT_WORD_BYTES);
+    if (rows <= XRT_QC_MAX_ROWS_SMALL) {
+        if (ctx->qc_planned.emplace(w, need).second) ctx->qc_planned_bytes += need;
+        return true;
+    }
+    if (ctx->qc_head < 0 && ctx->qc_planned_bytes > 0) {
+        ctx->qc_head = ctx->qc_planned_bytes + need <= ctx->qc_arena_bytes;
+        fprintf(stderr, "XRT Backend: output head %s (%.1f + %.1f of %zu MiB per engine).\n",
+                ctx->qc_head ? "on the card" : "on the CPU", double(ctx->qc_planned_bytes) / (1 << 20),
+                double(need) / (1 << 20), ctx->qc_arena_bytes >> 20);
+    }
+    return ctx->qc_head == 1;
+}
 static constexpr unsigned XRT_QC_OP_ROPE = 10;
 static constexpr unsigned XRT_QC_NORM_L2 = 1, XRT_QC_NORM_NO_WEIGHT = 2;
 static constexpr unsigned XRT_QC_UNARY_SILU = 1, XRT_QC_UNARY_SIGMOID = 2, XRT_QC_UNARY_SOFTPLUS = 3, XRT_QC_UNARY_COPY = 4;
@@ -923,6 +1048,9 @@ struct xrt_qc_list {
     std::vector<std::function<void(xrt_backend_context *)>> verifies;  // DeltaNet opcodes
     size_t in_used = 0, out_used = XRT_QC_OUT_BASE;
     size_t state_load_at = 0;  // command word where the next STATE_LOAD goes: behind the list's last GDN step
+    // The list's last GDN step while nothing follows it yet: its flags word, the end of its slots, its output.
+    size_t gdn_flags_at = SIZE_MAX, gdn_end = 0;
+    unsigned gdn_y = 0, gdn_cols = 0;
     std::unordered_map<const ggml_tensor *, size_t> late_at;  // GEMV command (word) to move behind its GDN step
     std::unordered_map<const ggml_tensor *, size_t> conv_src_at;  // GEMV command (word) that may get a CONV epilog
     std::unordered_map<const ggml_tensor *, size_t> add_src_at;   // GEMV command (word) that may get an ADD epilog
@@ -942,6 +1070,8 @@ struct xrt_qc_list {
         for (auto * m : {&late_at, &conv_src_at, &add_src_at, &deferred_at}) {
             for (auto & e : *m) if (e.second >= from) e.second = size_t(std::ptrdiff_t(e.second) + delta);
         }
+        // Behind a GDN_WITH_OUT GEMV the STATE_LOAD also goes behind the ADD inserted there (its epilog).
+        if (state_load_at >= from) state_load_at = size_t(std::ptrdiff_t(state_load_at) + delta);
     }
     // Readback filter: with last_use set, a flush copies an output back only if a later split reads it, it is a graph
     // output, or a node of this split at or after pos reads it (last_use: data owner -> last reading node).
@@ -1000,7 +1130,7 @@ static bool xrt_qc_fits(const xrt_qc_list & list, const std::vector<std::pair<co
     size_t in = 0;
     for (const auto & i : inputs) if (list.find(i.first) == nullptr) in += xrt_qc_round16(i.second);
     return list.in_used + in <= XRT_QC_OUT_BASE && list.out_used + xrt_qc_round16(out_floats) <= XRT_QC_ACT_FLOATS &&
-           (list.cmds.size() / XRT_QC_CMD_WORDS + new_cmds) * XRT_QC_CMD_WORDS * sizeof(unsigned) <= XRT_QC_CMD_BYTES;
+           (list.cmds.size() / XRT_QC_CMD_WORDS + new_cmds) * XRT_QC_CMD_WORDS * sizeof(unsigned) <= xrt_qc_cmd_bytes();
 }
 
 static unsigned xrt_qc_input(xrt_backend_context * ctx, xrt_qc_list & list, const void * data, size_t floats) {
@@ -1032,7 +1162,7 @@ static void xrt_qc_verify(xrt_backend_context * ctx, const xrt_qc_list::check & 
     const bool gemv = c.op == XRT_QC_OP_GEMV;
     if (gemv) {
         const ggml_tensor * w = node->src[0];
-        ref = gemvq_ref::reference(static_cast<const uint8_t *>(w->data), a, n, c.a_len,
+        ref = gemvq_ref::reference(xrt_gguf(w).data, a, n, c.a_len,
                                    xrt_qc_format(w->type, ctx->qc_features), magnitude);
     } else if (c.op == XRT_QC_OP_RMSNORM) {
         ref = gemvq_ref::rmsnorm(a, b, n, c.eps);
@@ -1149,22 +1279,121 @@ static void xrt_qc_launch(xrt_backend_context * ctx, unsigned n_cmds) {
     }
 }
 
-// Feature probe: a launch without commands writes GEMVQC_FEATURES into the first act float; older kernels
-// leave the zero there.
+// Feature probe: a launch without commands writes GEMVQC_FEATURES into the first act float and GEMVQC_FEATURES2 into
+// the second; older kernels leave the zeros there (or write a zero second word).
 static uint32_t xrt_qc_probe_features(xrt_backend_context * ctx) {
     const uint32_t zero[16] = {};
     ctx->qc_act_bo.write(zero, sizeof(zero), 0);
     ctx->qc_act_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, sizeof(zero), 0);
     xrt_qc_launch(ctx, 0);
     ctx->qc_act_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, sizeof(zero), 0);
-    uint32_t word = 0;
-    ctx->qc_act_bo.read(&word, sizeof(word), 0);
-    const uint32_t features = (word & 0xFFFF0000U) == XRT_QC_FEATURE_MARK ? (word & 0xFFFFU) : 0U;
+    uint32_t word[2] = {};
+    ctx->qc_act_bo.read(word, sizeof(word), 0);
+    const uint32_t features = (word[0] & 0xFFFF0000U) != XRT_QC_FEATURE_MARK ? 0U :
+        (word[0] & 0xFFFFU) | ((word[1] & 0xFFFF0000U) == XRT_QC_FEATURE2_MARK ? (word[1] & 0xFFFFU) << 16 : 0U);
     // GGML_XRT_FEATURE_MASK=<bits> (diagnostic): hides fusion bits of the kernel, so their plain command sequences
     // run instead. The format and layout bits (Q5_K, Q6_K, Q4_1, packed Q6_K) always stay.
+    ctx->qc_z_early = (features & XRT_QC_FEATURE_GDN_OUT) != 0;
     const char * mask = std::getenv("GGML_XRT_FEATURE_MASK");
     const uint32_t keep = XRT_QC_FEATURE_Q5_K | XRT_QC_FEATURE_Q6_K | XRT_QC_FEATURE_Q4_1 | XRT_QC_FEATURE_Q6K_PACKED;
     return mask != nullptr ? features & (uint32_t(std::strtoul(mask, nullptr, 0)) | keep) : features;
+}
+
+// Cycle trace totals per command kind (GGML_XRT_TRACE). An iteration with a pass is split into the time before the
+// pass (x copy, GDN inputs), the pass and the time after it (GDN output); "ideal" is the pass length if the busiest
+// engine streamed one word per cycle.
+struct xrt_trace_class {
+    uint64_t count = 0, cycles = 0, before = 0, pass = 0, after = 0, ideal = 0;
+};
+
+struct xrt_trace_totals {
+    std::mutex mutex;
+    std::map<std::string, xrt_trace_class> classes;
+    uint64_t launches = 0, list_cycles = 0, dropped = 0;
+    bool emulated = false;
+    ~xrt_trace_totals() {
+        if (launches == 0) return;
+        const uint64_t graphs = std::max<uint64_t>(1, g_xrt_timing.graph_count.load());
+        const double ms = 1e-5;  // per cycle at 100 MHz
+        fprintf(stderr, "XRT-TRACE: %s launches=%llu graphs=%llu list_cycles=%llu (%.2f ms per graph at 100 MHz), "
+                        "dropped events=%llu\n", emulated ? "emulator, event numbers instead of cycles," : "",
+                (unsigned long long) launches, (unsigned long long) graphs, (unsigned long long) list_cycles,
+                list_cycles * ms / graphs, (unsigned long long) dropped);
+        for (const auto & [name, c] : classes) {
+            fprintf(stderr, "XRT-TRACE: %-10s n=%-6llu %.3f ms/graph", name.c_str(), (unsigned long long) c.count,
+                    c.cycles * ms / graphs);
+            if (c.pass != 0) {
+                fprintf(stderr, " (before %.3f, pass %.3f, after %.3f; ideal %.3f, pass - ideal %.3f)",
+                        c.before * ms / graphs, c.pass * ms / graphs, c.after * ms / graphs, c.ideal * ms / graphs,
+                        (double(c.pass) - double(c.ideal)) * ms / graphs);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+};
+static xrt_trace_totals g_xrt_trace;
+
+// Reads the TRACE log of the last launch (its list without the leading TRACE command is cmds) into the totals.
+static void xrt_qc_trace_collect(xrt_backend_context * ctx, const std::vector<unsigned> & cmds) {
+    std::vector<uint32_t> raw(XRT_QC_TRACE_FLOATS);
+    ctx->qc_act_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, raw.size() * sizeof(uint32_t), XRT_QC_TRACE_OFF * sizeof(float));
+    ctx->qc_act_bo.read(raw.data(), raw.size() * sizeof(uint32_t), XRT_QC_TRACE_OFF * sizeof(float));
+    const unsigned stored = std::min(raw[0], XRT_QC_TRACE_ENTRIES), total = raw[1];
+    const size_t n = cmds.size() / XRT_QC_CMD_WORDS;
+    const bool packed = (ctx->qc_features & XRT_QC_FEATURE_Q6K_PACKED) != 0;
+    // Command c of the launch is cmds command c - 1 (c = 0 is the TRACE command).
+    const auto name = [&](unsigned c) -> std::string {
+        if (c == 0) return "trace";
+        if (c > n) return "end";
+        static const char * names[] = {"?", "gemv", "rmsnorm", "add", "silu_mul", "mul", "unary", "gdn", "conv",
+                                       "state_load", "rope"};
+        const unsigned op = cmds[(c - 1) * XRT_QC_CMD_WORDS];
+        return op < sizeof(names) / sizeof(names[0]) ? names[op] : "?";
+    };
+    const auto ideal = [&](unsigned c, unsigned end) {
+        uint64_t words = 0;
+        bool blocked = false;  // the next GEMV is a GDN step's GDN_WITH_OUT GEMV
+        for (unsigned k = std::max(c, 1U); k < end && k <= n; ++k) {
+            const unsigned * cmd = &cmds[(k - 1) * XRT_QC_CMD_WORDS];
+            if (cmd[0] == XRT_QC_OP_GDN && k < n) blocked = (cmd[XRT_QC_CMD_WORDS + 3] & XRT_QC_GDN_WITH_OUT) != 0;
+            if (cmd[0] != 1U) continue;
+            const unsigned format = cmd[1] & 0xffU;
+            words += (cmd[2] + ctx->qc_engines - 1) / ctx->qc_engines *
+                     (blocked ? gemvqw_layout::words_per_row_blocked(cmd[3], format, XRT_QC_OUT_BLOCK, packed)
+                              : gemvqw_layout::words_per_row(cmd[3], format, packed));
+            blocked = false;
+        }
+        return words;
+    };
+    std::lock_guard<std::mutex> lock(g_xrt_trace.mutex);
+    g_xrt_trace.emulated = ctx->qc_emulate;
+    ++g_xrt_trace.launches;
+    g_xrt_trace.dropped += total - stored;
+    uint32_t it = 0, ps = 0, pe = 0;
+    unsigned cur = 0;
+    bool pass = false;
+    for (unsigned i = 0; i < stored; ++i) {
+        const uint32_t cycle = raw[16 + 2 * i], tag = raw[16 + 2 * i + 1];
+        const unsigned c = tag & 0xffffU, kind = (tag >> 16) & 3U;
+        if (kind == 1) { ps = cycle; pass = true; }
+        if (kind == 2) pe = cycle;
+        if (kind != 0 && kind != 3) continue;
+        if (i != 0) {
+            auto & k = g_xrt_trace.classes[name(cur)];
+            ++k.count;
+            k.cycles += cycle - it;
+            if (pass) {
+                k.before += ps - it;
+                k.pass += pe - ps;
+                k.after += cycle - pe;
+                k.ideal += ideal(cur, c);
+            }
+        }
+        if (kind == 3) g_xrt_trace.list_cycles += cycle;
+        it = cycle;
+        cur = c;
+        pass = false;
+    }
 }
 
 static void xrt_qc_flush(xrt_backend_context * ctx, xrt_qc_list & list) {
@@ -1182,13 +1411,20 @@ static void xrt_qc_flush(xrt_backend_context * ctx, xrt_qc_list & list) {
         if (later) needed.push_back(d.first);
     }
     for (const auto * t : needed) list.undefer(t);
+    const bool trace = xrt_trace_requested() && ctx->qc_gdn && (ctx->qc_features & XRT_QC_FEATURE_TRACE) != 0;
+    const size_t first = trace ? XRT_QC_CMD_WORDS * sizeof(unsigned) : 0;  // the TRACE command goes in front
     {
         xrt_scoped_ns x_timer{g_xrt_timing.gemv_x_ns};
         ctx->qc_act_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, align_xrt_word(list.in_used * sizeof(float)), 0);
-        ctx->qc_cmd_bo.write(list.cmds.data(), list.cmds.size() * sizeof(unsigned), 0);
-        ctx->qc_cmd_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, align_xrt_word(list.cmds.size() * sizeof(unsigned)), 0);
+        if (trace) {
+            const unsigned trace_cmd[XRT_QC_CMD_WORDS] = {XRT_QC_OP_TRACE, unsigned(XRT_QC_TRACE_OFF)};
+            ctx->qc_cmd_bo.write(trace_cmd, sizeof(trace_cmd), 0);
+        }
+        ctx->qc_cmd_bo.write(list.cmds.data(), list.cmds.size() * sizeof(unsigned), first);
+        ctx->qc_cmd_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, align_xrt_word(first + list.cmds.size() * sizeof(unsigned)), 0);
     }
-    xrt_qc_launch(ctx, unsigned(list.cmds.size() / XRT_QC_CMD_WORDS));
+    xrt_qc_launch(ctx, unsigned(list.cmds.size() / XRT_QC_CMD_WORDS) + (trace ? 1U : 0U));
+    if (trace) xrt_qc_trace_collect(ctx, list.cmds);
     {
         xrt_scoped_ns y_timer{g_xrt_timing.gemv_y_ns};
         const auto needed = [&](const ggml_tensor * t) {
@@ -1216,6 +1452,12 @@ if (list.last_use == nullptr || (t->flags & (GGML_TENSOR_FLAG_SPLIT_OUTPUT | GGM
         if (xrt_debug_enabled()) {
             fprintf(stderr, "XRT-DEBUG: gemvqc16 list commands=%zu inputs=%zu floats outputs=%zu floats, %zu copied back\n",
                     list.cmds.size() / XRT_QC_CMD_WORDS, list.in_used, list.out_used - XRT_QC_OUT_BASE, copied);
+            // Opcode word of every slot (GDN extension slots count under their first word, which is no opcode).
+            unsigned ops[16] = {};
+            for (size_t i = 0; i < list.cmds.size(); i += XRT_QC_CMD_WORDS) ++ops[std::min(list.cmds[i], 15U)];
+            fprintf(stderr, "XRT-DEBUG: gemvqc16 list opcodes:");
+            for (unsigned o = 1; o < 15; ++o) if (ops[o] != 0) fprintf(stderr, " %u:%u", o, ops[o]);
+            fprintf(stderr, "\n");
         }
     }
     for (const auto & c : list.checks) {
@@ -1290,12 +1532,13 @@ static bool xrt_qc_is_view(const ggml_tensor * node) {
 
 // Appends GEMV commands (row chunks of at most XRT_QC_CMD_ROWS) for MUL_MAT node with x at a_off, y at y_off.
 // flags go into the format word (XRT_QC_GEMV_SWIGLU, only for a single chunk).
+// block_cols: one command on the column-blocked weights (the caller checked rows <= XRT_QC_CMD_ROWS).
 static void xrt_qc_emit_gemv(xrt_backend_context * ctx, xrt_qc_list & list, ggml_tensor * node, unsigned a_off,
-                             unsigned y_off, unsigned flags = 0) {
+                             unsigned y_off, unsigned flags = 0, unsigned block_cols = 0) {
     const ggml_tensor * w = node->src[0];
     const unsigned format = xrt_qc_format(w->type, ctx->qc_features);
     const unsigned cols = unsigned(w->ne[0]), n = unsigned(node->ne[0]);
-    const uint64_t w_off = xrt_qc_weight_offset(ctx, w);
+    const uint64_t w_off = xrt_qc_weight_offset(ctx, w, block_cols);
     // Row chunks start at multiples of the engine count, so engine e's rows of a chunk follow each other in its
     // arena at (r0 / engines) rows past the tensor start.
     for (unsigned r0 = 0; r0 < n; r0 += unsigned(XRT_QC_CMD_ROWS)) {
@@ -1399,7 +1642,7 @@ static bool xrt_qc_is_weight(const ggml_tensor * t) {
 static unsigned xrt_qc_const(xrt_backend_context * ctx, const ggml_tensor * t) {
     if (const auto it = ctx->qc_consts.find(t->data); it != ctx->qc_consts.end()) return it->second;
     const size_t floats = size_t(ggml_nelements(t)), padded = xrt_qc_round16(floats);
-    if (XRT_QC_RES_BASE + ctx->qc_resident_used + padded > XRT_QC_ACT_BYTES_GDN / sizeof(float)) {
+    if (XRT_QC_RES_BASE + ctx->qc_resident_used + padded > XRT_QC_TRACE_OFF) {
         throw std::runtime_error(std::string("gemvqc16 resident act region full at ") + t->name);
     }
     const unsigned off = unsigned(XRT_QC_RES_BASE + ctx->qc_resident_used);
@@ -1432,7 +1675,7 @@ static std::vector<unsigned> xrt_qc_operands(xrt_backend_context * ctx, xrt_qc_l
     }
     flush = flush || list.in_used + in > XRT_QC_OUT_BASE ||
             list.out_used + xrt_qc_round16(out_floats) > xrt_qc_act_floats(ctx) ||
-            (list.cmds.size() / XRT_QC_CMD_WORDS + new_cmds) * XRT_QC_CMD_WORDS * sizeof(unsigned) > XRT_QC_CMD_BYTES;
+            (list.cmds.size() / XRT_QC_CMD_WORDS + new_cmds) * XRT_QC_CMD_WORDS * sizeof(unsigned) > xrt_qc_cmd_bytes();
     if (flush) xrt_qc_flush(ctx, list);
     xrt_scoped_ns operands_timer{g_xrt_timing.operands_ns};
     std::vector<unsigned> offs;
@@ -1835,6 +2078,13 @@ static bool xrt_qc_build_plan(const xrt_backend_context * ctx, struct ggml_cgrap
         int prev = -1;
         for (int i = 0; i < n_nodes; i++) {
             if (cgraph->nodes[i]->op != GGML_OP_GATED_DELTA_NET) continue;
+            // Kernels with GDN_OUT run the gated norm in the step's pass and read z when the step starts, also when
+            // GDN_OUT is masked or unused: z stays in front.
+            const auto ni = norms_of.find(cgraph->nodes[i]);
+            if (ctx->qc_z_early && ni != norms_of.end() && ni->second.out != nullptr) {
+                prev = i;
+                continue;
+            }
             const ggml_tensor * best = nullptr;
             for (int j = prev + 1; j < i; j++) {
                 const ggml_tensor * m = cgraph->nodes[j];
@@ -1981,6 +2231,7 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
     const auto root_of = xrt_qc_data_root;
     const bool state_load = (ctx->qc_features & XRT_QC_FEATURE_STATE_LOAD) != 0;
     std::vector<const ggml_tensor *> fused_silu;  // SILU nodes folded into the next MUL
+    std::vector<const ggml_tensor *> fused_sigmoid;  // SIGMOID nodes folded into the next MUL (attention output gate)
     xrt_qc_list list;
     if (with_last_use) list.last_use = &plan->last_use;
     plan_timer.reset();
@@ -2005,7 +2256,18 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                 if (late_set.count(node) != 0) list.late_at[node] = list.cmds.size();
                 if (conv_src.count(node) != 0) list.conv_src_at[node] = list.cmds.size();
                 if (add_src.count(node) != 0) list.add_src_at[node] = list.cmds.size();
-                xrt_qc_emit_gemv(ctx, list, node, offs[0], y_off);
+                // Right behind a GDN step on its output: the GEMV runs in the step's pass (GDN_WITH_OUT), and the
+                // next STATE_LOAD goes behind it (and behind its ADD epilog).
+                const bool with_out = (ctx->qc_features & XRT_QC_FEATURE_GDN_OUT) && list.gdn_flags_at != SIZE_MAX &&
+                                      list.cmds.size() == list.gdn_end && offs[0] == list.gdn_y && cols == list.gdn_cols &&
+                                      cols % XRT_QC_OUT_BLOCK == 0 && n <= XRT_QC_OUT_MAX_ROWS * ctx->qc_engines &&
+                                      n <= size_t(XRT_QC_CMD_ROWS);
+                if (with_out) {
+                    list.cmds[list.gdn_flags_at] |= XRT_QC_GDN_WITH_OUT;
+                    list.state_load_at = list.cmds.size() + XRT_QC_CMD_WORDS;
+                }
+                list.gdn_flags_at = SIZE_MAX;
+                xrt_qc_emit_gemv(ctx, list, node, offs[0], y_off, 0, with_out ? XRT_QC_OUT_BLOCK : 0U);
                 list.checks.push_back({XRT_QC_OP_GEMV, node, offs[0], 0, y_off, unsigned(cols), 0.0f});
                 break;
             }
@@ -2063,20 +2325,38 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                     fprintf(stderr, "XRT: broadcast MUL %s is not the weight of the preceding RMS_NORM\n", node->name);
                     return GGML_STATUS_FAILED;
                 }
-                // plain product, or x * SILU(z) with the SILU folded in
+                // plain product, x * SILU(z) with the SILU folded in, or x * SIGMOID(z) with the SIGMOID (and the CONT
+                // of strided rows it reads) folded in
                 const bool silu = std::find(fused_silu.begin(), fused_silu.end(), b) != fused_silu.end();
-                const ggml_tensor * g = silu ? b->src[0] : b;
-                const auto offs = xrt_qc_operands(ctx, list, {{g, g->data, n}, {a, a->data, n}}, n, 1);
+                const bool sigmoid = std::find(fused_sigmoid.begin(), fused_sigmoid.end(), b) != fused_sigmoid.end();
+                const ggml_tensor * g = silu || sigmoid ? b->src[0] : b;
+                if (sigmoid && cont_folded.count(b) != 0) g = g->src[0];
+                const bool strided = sigmoid && g != b->src[0];
+                const unsigned row = strided ? unsigned(g->ne[0]) : 0U, stride = strided ? unsigned(g->nb[1] / sizeof(float)) : 0U;
+                const auto offs = xrt_qc_operands(ctx, list, {{g, g->data, strided ? xrt_qc_rows_span(g) : n}, {a, a->data, n}},
+                                                  n, 1);
                 const unsigned y_off = xrt_qc_output(list, node, n);
                 if (silu) xrt_qc_push(list, {XRT_QC_OP_SILU_MUL, unsigned(n), offs[0], offs[1], y_off});
+                else if (sigmoid) xrt_qc_push(list, {XRT_QC_OP_SILU_MUL, unsigned(n), offs[0], offs[1], y_off, 1U, row, stride});
                 else xrt_qc_push(list, {XRT_QC_OP_MUL, unsigned(n), offs[1], offs[0], y_off});
                 if (verify) {
                     const unsigned g_off = offs[0], x_off = offs[1];
                     list.verifies.push_back([=](xrt_backend_context * c) {
                         const float * act = c->qc_act_bo.map<const float *>();
-                        const auto ref = silu ? gemvq_ref::silu_mul(act + g_off, act + x_off, unsigned(n))
-                                              : gemvq_ref::mul(act + x_off, act + g_off, unsigned(n));
-                        xrt_qc_report(silu ? "silu_mul" : "mul", node->name, act + y_off, ref, {});
+                        std::vector<float> ref;
+                        if (sigmoid) {
+                            std::vector<float> gs;  // the gate rows, packed
+                            for (size_t i = 0; i < n; i += (row ? row : n)) {
+                                const float * src = act + g_off + (row ? (i / row) * stride : 0);
+                                gs.insert(gs.end(), src, src + (row ? row : n));
+                            }
+                            const auto sg = gemvq_ref::unary(gs.data(), unsigned(n), XRT_QC_UNARY_SIGMOID);
+                            ref = gemvq_ref::mul(act + x_off, sg.data(), unsigned(n));
+                        } else {
+                            ref = silu ? gemvq_ref::silu_mul(act + g_off, act + x_off, unsigned(n))
+                                       : gemvq_ref::mul(act + x_off, act + g_off, unsigned(n));
+                        }
+                        xrt_qc_report(silu ? "silu_mul" : (sigmoid ? "sigmoid_mul" : "mul"), node->name, act + y_off, ref, {});
                     });
                 }
                 break;
@@ -2097,10 +2377,10 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                         list.verifies.push_back([=](xrt_backend_context * c) {
                             const float * act = c->qc_act_bo.map<const float *>();
                             std::vector<double> gm, um;
-                            const auto gr = gemvq_ref::reference(static_cast<const uint8_t *>(g->src[0]->data), act + x_off,
+                            const auto gr = gemvq_ref::reference(xrt_gguf(g->src[0]).data, act + x_off,
                                                                  unsigned(n), unsigned(cols),
                                                                  xrt_qc_format(g->src[0]->type, c->qc_features), gm);
-                            const auto ur = gemvq_ref::reference(static_cast<const uint8_t *>(u->src[0]->data), act + x_off,
+                            const auto ur = gemvq_ref::reference(xrt_gguf(u->src[0]).data, act + x_off,
                                                                  unsigned(n), unsigned(cols),
                                                                  xrt_qc_format(u->src[0]->type, c->qc_features), um);
                             unsigned bad = 0;
@@ -2143,7 +2423,7 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                             list.verifies.push_back([=](xrt_backend_context * c) {
                                 const float * act = c->qc_act_bo.map<const float *>();
                                 std::vector<double> mag;
-                                const auto ref = gemvq_ref::reference(static_cast<const uint8_t *>(mw->data), act + mx_off,
+                                const auto ref = gemvq_ref::reference(xrt_gguf(mw).data, act + mx_off,
                                                                      unsigned(n), mcols, xrt_qc_format(mw->type, c->qc_features), mag);
                                 unsigned bad = 0;
                                 double worst = 0;
@@ -2209,7 +2489,7 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                             list.verifies.push_back([=](xrt_backend_context * c) {
                                 const float * act = c->qc_act_bo.map<const float *>();
                                 std::vector<double> mag;
-                                const auto q = gemvq_ref::reference(static_cast<const uint8_t *>(qw->data), act + qx_off, ch,
+                                const auto q = gemvq_ref::reference(xrt_gguf(qw).data, act + qx_off, ch,
                                                                    qcols, xrt_qc_format(qw->type, c->qc_features), mag);
                                 std::vector<float> new_state;
                                 const auto ref = gemvq_ref::conv(old_state.data(), q.data(), act + w_off, ch, true, new_state);
@@ -2254,6 +2534,12 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                     next->src[1] == node && next->src[0] != node && use_count(node) == 1 &&
                     ggml_nelements(next) == ggml_nelements(node)) {
                     fused_silu.push_back(node);
+                    break;  // emitted with the MUL
+                }
+                if ((ctx->qc_features & XRT_QC_FEATURE_SIGMOID_MUL) && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+                    next != nullptr && next->op == GGML_OP_MUL && next->src[1] == node && next->src[0] != node &&
+                    use_count(node) == 1 && ggml_nelements(next) == ggml_nelements(node)) {
+                    fused_sigmoid.push_back(node);
                     break;  // emitted with the MUL
                 }
                 unsigned kind = 0;
@@ -2381,6 +2667,10 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                                    (late_cmd.empty() ? 0U : XRT_QC_GDN_WITH_GEMV) | norm_flags, xrt_qc_float_bits(nm.l2_eps),
                                    xrt_qc_float_bits(nm.rms_eps), w_off, z_off});
                 if (gates) xrt_qc_push(list, {dt_off, a_off});
+                list.gdn_flags_at = late_cmd.empty() ? list.cmds.size() - (gates ? 2U : 1U) * XRT_QC_CMD_WORDS + 3U : SIZE_MAX;
+                list.gdn_end = list.cmds.size();
+                list.gdn_y = y_off;
+                list.gdn_cols = hv * unsigned(S);
                 list.cmds.insert(list.cmds.end(), late_cmd.begin(), late_cmd.end());
                 list.state_load_at = list.cmds.size();
                 if (verify) {
@@ -2543,7 +2833,8 @@ static ggml_backend_t ggml_backend_xrt_dev_init_backend(ggml_backend_dev_t dev, 
 #ifdef GGML_XRT_EMULATE_ENGINES
             ctx->qc_engines = GGML_XRT_EMULATE_ENGINES;
 #endif
-            ctx->qc_arena_bytes = XRT_QC_ARENA_BYTES_PAIR;
+            // Like the cards: more than 16 engine ports sit on single HBM channels.
+            ctx->qc_arena_bytes = ctx->qc_engines > 16 ? XRT_QC_ARENA_BYTES : XRT_QC_ARENA_BYTES_PAIR;
             for (unsigned e = 0; e < ctx->qc_engines; ++e) ctx->qc_weight_bos.emplace_back(ctx->qc_arena_bytes);
             ctx->qc_act_bo = xrt_qc_mem(XRT_QC_ACT_BYTES_GDN);
             ctx->qc_cmd_bo = xrt_qc_mem(XRT_QC_CMD_BYTES);
@@ -2642,8 +2933,9 @@ static ggml_backend_t ggml_backend_xrt_dev_init_backend(ggml_backend_dev_t dev, 
         };
         const int n_buffer_args = act_rd_arg >= 0 ? act_rd_arg + 1
                                                   : act_arg + 2 + (ctx->qc_gdn ? int(2 * XRT_QC_STATE_PORTS) + 1 : 0);
+        // Unset: direct start whenever ert_disable=1; GGML_XRT_DIRECT_START=0 keeps the XRT start.
         const char * direct_env = std::getenv("GGML_XRT_DIRECT_START");
-        ctx->qc_direct = direct_env != nullptr && std::strcmp(direct_env, "0") != 0;
+        ctx->qc_direct = direct_env != nullptr ? std::strcmp(direct_env, "0") != 0 : xrt_ert_disable(ctx->device) == 1;
         if (ctx->qc_direct) {
             if (xrt_ert_disable(ctx->device) != 1) {
                 throw std::runtime_error("GGML_XRT_DIRECT_START needs ert_disable=1 (load the xclbin with ert_disable=0 first)");
@@ -2731,7 +3023,8 @@ static bool ggml_backend_xrt_dev_supports_buft(ggml_backend_dev_t dev, ggml_back
     // Any host buffer is usable in place. This matters for the mmap-ed model weights ("CPU_Mapped", a different
     // buffer type object than the plain CPU one): if they are reported as unsupported, the scheduler copies every
     // weight tensor into a backend buffer before each split although the backend uploads its own device copy.
-    return ggml_backend_buft_is_host(buft) || buft == &xrt_rs_buft;
+    // CPU repack weights are read back into GGUF layout at upload (xrt_gguf); supports_op filters the layouts.
+    return ggml_backend_buft_is_host(buft) || buft == &xrt_rs_buft || xrt_buft_is_cpu_repack(buft);
 }
 
 extern "C" {

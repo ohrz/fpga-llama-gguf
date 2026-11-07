@@ -91,6 +91,13 @@ float silu_mul_f(float g, float u) {
     return (g / (1.0f + hls::expf(-g))) * u;
 }
 
+// The SILU_MUL opcode's lane: silu_mul_f, or with sigmoid sigmoid(g) * u (the UNARY sigmoid 1 / (1 + e^-g), then MUL).
+float silu_sigmoid_mul_f(float g, float u, bool sigmoid) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE II=1
+    return ((sigmoid ? 1.0f : g) / (1.0f + hls::expf(-g))) * u;
+}
+
 float sumsq16(const vword & w) {
 #pragma HLS INLINE off
 #pragma HLS PIPELINE II=1
@@ -228,14 +235,14 @@ void rownorm(vword * act, unsigned n, unsigned rows, unsigned x_off, unsigned w_
 
 // A deferred RMSNORM / L2 norm of one row: x (and the weight) go to the on-chip copies nx / nw, nothing is written to
 // act; returns the scale, summed exactly like rownorm (same word sums, slots and row_scale), so a quantizer that
-// applies (x * scale) * w (x_source) sees the values rownorm would have stored.
-float norm_defer(vword * act, unsigned n, unsigned x_off, unsigned w_off, float eps, unsigned flags, vword * nx,
-                 vword * nw) {
+// applies (x * scale) * w (x_source) sees the values rownorm would have stored. One loop: x arrives through act and
+// is summed as it comes, the weight arrives at the same time through act_rd (the same buffer; earlier commands have
+// finished writing it).
+float norm_defer(const vword * act, const vword * act_rd, unsigned n, unsigned x_off, unsigned w_off, float eps,
+                 unsigned flags, vword * nx, vword * nw) {
     const unsigned wpr = n / 16U;
     const unsigned live = wpr < 8U ? wpr : 8U;
-    const bool l2 = (flags & NORM_L2) != 0, weighted = (flags & NORM_NO_WEIGHT) == 0;
-    load_words(act + x_off / 16U, wpr, nx);
-    if (weighted) load_words(act + w_off / 16U, wpr, nw);
+    const bool l2 = (flags & NORM_L2) != 0;
     float acc[8];
 #pragma HLS ARRAY_PARTITION variable=acc complete
 #pragma HLS DEPENDENCE variable=acc inter false
@@ -246,8 +253,11 @@ float norm_defer(vword * act, unsigned n, unsigned x_off, unsigned w_off, float 
     float scale = 1.0f;
     NORM_DEFER_SUM: for (unsigned pos = 0; pos < wpr; ++pos) {
 #pragma HLS PIPELINE II=1
+        const vword xw = act[x_off / 16U + pos];
+        nx[pos] = xw;
+        nw[pos] = act_rd[w_off / 16U + pos];  // unused without weight
         const unsigned slot = pos & 7U;
-        const float next = add_f(pos < 8U ? 0.0f : acc[slot], sumsq16(nx[pos]));
+        const float next = add_f(pos < 8U ? 0.0f : acc[slot], sumsq16(xw));
         acc[slot] = next;
         if (pos == wpr - 1U) {
             float part[8];
@@ -325,11 +335,13 @@ void add_mul(vword * act, unsigned n, unsigned a_off, unsigned b_off, unsigned y
     store_words(buf_a, words, act + y_off / 16U);
 }
 
-// y = g / (1 + exp(-g)) * u, four lanes per cycle to keep the number of exp units small.
-void silu_mul(vword * act, unsigned n, unsigned g_off, unsigned u_off, unsigned y_off, vword * buf_a,
-              vword * buf_b) {
+// y = g / (1 + exp(-g)) * u, four lanes per cycle to keep the number of exp units small; with sigmoid
+// y = 1 / (1 + exp(-g)) * u (attention output gate). g may be strided like the x of unary (row_n 0: contiguous).
+void silu_mul(vword * act, unsigned n, unsigned g_off, unsigned u_off, unsigned y_off, bool sigmoid, unsigned row_n,
+              unsigned stride, vword * buf_a, vword * buf_b) {
     const unsigned words = n / 16U;
-    load_words(act + g_off / 16U, words, buf_a);
+    if (row_n == 0) load_words(act + g_off / 16U, words, buf_a);
+    else load_rows(act + g_off / 16U, row_n / 16U, n / row_n, stride / 16U, buf_a);
     load_words(act + u_off / 16U, words, buf_b);
     vword y = 0;
     SILU_APPLY: for (unsigned j = 0; j < words * 4U; ++j) {
@@ -341,7 +353,7 @@ void silu_mul(vword * act, unsigned n, unsigned g_off, unsigned u_off, unsigned 
 #pragma HLS UNROLL
             const unsigned lane = q * 4U + l;
             const float gv = word_lane_float(g, lane);
-            y.range(lane * 32 + 31, lane * 32) = lane_bits(silu_mul_f(gv, word_lane_float(u, lane)));
+            y.range(lane * 32 + 31, lane * 32) = lane_bits(silu_sigmoid_mul_f(gv, word_lane_float(u, lane), sigmoid));
         }
         if (q == 3U) buf_a[i] = y;
     }

@@ -135,12 +135,25 @@ inline void append_row(const uint8_t * row, unsigned cols, unsigned format, std:
 }
 
 // Splits a row-major GGUF matrix over `engines` arenas: row r goes to engine r % engines.
+// block_cols (column-blocked layout of gemvqc16's GDN_WITH_OUT GEMV, 256): the matrix as consecutive column blocks,
+// each the layout above of its block_cols columns; in an arena all rows of block 0, then all rows of block 1, ...
 inline std::vector<std::vector<uint8_t>> repack(const uint8_t * matrix, unsigned rows, unsigned cols, unsigned format,
-                                                unsigned engines, bool q6k_packed = true) {
+                                                unsigned engines, bool q6k_packed = true, unsigned block_cols = 0) {
     std::vector<std::vector<uint8_t>> arenas(engines);
     const size_t bytes = row_bytes(cols, format);
-    for (unsigned r = 0; r < rows; ++r) append_row(matrix + r * bytes, cols, format, arenas[r % engines], q6k_packed);
+    const unsigned bc = block_cols != 0 ? block_cols : cols;
+    const size_t block_bytes = row_bytes(bc, format);
+    for (unsigned b = 0; b < cols / bc; ++b) {
+        for (unsigned r = 0; r < rows; ++r) {
+            append_row(matrix + r * bytes + b * block_bytes, bc, format, arenas[r % engines], q6k_packed);
+        }
+    }
     return arenas;
+}
+
+// Words of a row in the column-blocked layout.
+inline unsigned words_per_row_blocked(unsigned cols, unsigned format, unsigned block_cols, bool q6k_packed = true) {
+    return (cols / block_cols) * words_per_row(block_cols, format, q6k_packed);
 }
 
 } // namespace gemvqw_layout

@@ -9,7 +9,7 @@
 #   MODELS           directory with the GGUFs (default <repo>/models)
 #   GGML_XRT_XCLBIN  bitstream               (default <repo>/build/xclbin/gemvqc16.xclbin)
 #   THREADS          CPU threads             (default 16)
-# Set GGML_XRT_DIRECT_START=1 beforehand to use the direct register start (see docs/BUILD.md).
+# With ert_disable=1 the backend uses the direct register start (see docs/BUILD.md).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

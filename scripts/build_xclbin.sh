@@ -26,7 +26,9 @@ SYNTH_JOBS=${SYNTH_JOBS:-4}
 [ -f "$VITIS_SETTINGS" ] || { echo "Vitis settings script not found: $VITIS_SETTINGS (set VITIS_SETTINGS)" >&2; exit 1; }
 [ -f "$PLATFORM" ] || { echo "platform not found: $PLATFORM (set PLATFORM)" >&2; exit 1; }
 # shellcheck disable=SC1090
+set +u  # the Vitis settings script reads unset variables (PYTHONPATH)
 source "$VITIS_SETTINGS"
+set -u
 command -v v++ >/dev/null || { echo "v++ not on PATH after sourcing $VITIS_SETTINGS" >&2; exit 1; }
 
 mkdir -p "$OUT"

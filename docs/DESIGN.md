@@ -1,124 +1,158 @@
-# Design notes
+# Design description
 
-## Idea
+## 1. Principle
 
-Token generation is dominated by reading every weight once per token. The U50 has 8 GB of HBM2 with a peak of about
-316 GB/s, the host CPU of the test machine about 60 GB/s. The kernel keeps the quantized weights in HBM and streams them through 16
-engines, each reading its own HBM port at one 64-byte word per clock. Because the weights are kept in the original
-GGUF quantization, the card computes the same model as the CPU, not an approximation of it.
+Token generation reads each weight one time for each token. The U50 has 8 GB of HBM2 with a peak bandwidth of
+316 GB/s. The host CPU of the test machine has 60 GB/s.
 
-## The kernel (`fpga/src`)
+The kernel keeps the quantized weights in HBM. 20 engines read them. Each engine reads its own HBM port at one
+64-byte word for each clock. The weights stay in the original GGUF quantization. Because of this, the card
+calculates the same model as the CPU.
 
-`gemvqc16` is one HLS kernel that executes a **command list** from HBM. A launch runs up to 128 commands in order;
-they read and write FP32 vectors in one activation buffer, so a command can consume the result of an earlier one
-without involving the host.
+## 2. Kernel (`fpga/src`)
 
-| Opcode | Command | Notes |
+### 2.1 Command list
+
+`gemvqc16` is one HLS kernel. It runs a **command list** from HBM. One launch runs a maximum of 128 commands in
+sequence. The commands read and write FP32 vectors in one activation buffer. A command can use the result of
+an earlier command without the host.
+
+| Opcode | Command | Function |
 | --- | --- | --- |
-| 1 | `GEMV` | Q4_0, Q8_0, Q5_K, Q6_K weights times the vector in the activation buffer; optional epilog (see below) |
-| 2 | `RMSNORM` | per row, optional weight, optional L2 variant, strided rows, optionally *deferred* (see below) |
-| 3, 5 | `ADD`, `MUL` | element-wise |
-| 4 | `SILU_MUL` | SwiGLU: `silu(g) * u` |
-| 6 | `UNARY` | SiLU, sigmoid, softplus, copy; strided rows |
-| 7 | `GDN` | one Gated DeltaNet step (Qwen3.5), optionally with q/k L2 norm, gates and gated output norm |
-| 8 | `CONV` | one-token causal convolution (kernel width 4) with optional SiLU |
-| 9 | `STATE_LOAD` | starts reading the state of the next `GDN` step onto the chip while the following GEMVs run |
-| 10 | `ROPE` | rotary position embedding (NEOX pairing) of the query/key heads; the host supplies the cos/sin table |
+| 1 | `GEMV` | Q4_0, Q8_0, Q5_K or Q6_K weights × the vector in the activation buffer. Optional epilog (refer to 2.2) |
+| 2 | `RMSNORM` | norm for each row. Optional weight, optional L2 variant, rows with a stride, optional *deferred* norm (refer to 2.2) |
+| 3, 5 | `ADD`, `MUL` | element-wise operations |
+| 4 | `SILU_MUL` | SwiGLU `silu(g) * u`, or the sigmoid gate `sigmoid(g) * u` of the attention output |
+| 6 | `UNARY` | SiLU, sigmoid, softplus, copy. Rows with a stride |
+| 7 | `GDN` | one Gated DeltaNet step (Qwen3.5). Optional: q/k L2 norm, gates, gated output norm, output projection |
+| 8 | `CONV` | causal convolution for one token (kernel width 4), optional SiLU |
+| 9 | `STATE_LOAD` | starts to read the state of the next `GDN` step into the chip while the next GEMVs run |
+| 10 | `ROPE` | rotary position embedding (NEOX pairs) of the query and key heads. The host supplies the cos/sin table |
+| 11 | `TRACE` | records the clock cycle of each command start and each pass start and end (`GGML_XRT_TRACE=1`) |
 
-The command format is documented in `fpga/src/gemvqc16.h`. A launch with zero commands writes a *feature word*
-(GEMV formats and fusions the bitstream supports), which the backend probes at start-up; it uses a fusion only if
-the bitstream reports it.
+`fpga/src/gemvqc16.h` specifies the command format. A launch with zero commands writes a *feature word*. The
+feature word shows the GEMV formats and the fusions of the bitstream. The backend reads it at start. The backend
+uses a fusion only if the bitstream has it.
 
-### One pass, several commands
+### 2.2 Pass
 
-The kernel does not only run commands one by one. A *pass* is one dataflow region with the quantizer, the 16
-engines, the result writer and the four DeltaNet units; there is exactly one instance of it in hardware.
+A *pass* is one dataflow region with the quantizer, the 20 engines, the result writer and the four DeltaNet units.
+The hardware has one instance of it. One pass can do more than one command:
 
-- **GEMV groups.** Up to four consecutive GEMVs with the same input run as one pass: the input is quantized once
-  and the engines stream the matrices back to back.
-- **Epilogs.** A GEMV can carry a SwiGLU pair (`g` and `u` of the FFN), the residual `ADD` or the `CONV` of the
-  DeltaNet input; the result writer applies it, and the intermediate vector is never written.
-- **Deferred norm.** A deferred `RMSNORM` keeps its row on the chip; the next GEMVs on that row normalize while
-  quantizing (same arithmetic as the stored result would have).
-- **DeltaNet next to GEMVs.** The `GDN` step computes on an on-chip (URAM) copy of the state. `STATE_LOAD`
-  prefetches the next state and the previous one is written back during later GEMV passes; the step itself runs in
-  the same pass as the following GEMV (the `z` projection).
+- **GEMV groups.** A maximum of four sequential GEMVs with the same input run as one pass. The quantizer quantizes
+  the input one time. The engines read the matrices one after the other.
+- **Epilogs.** A GEMV can have a SwiGLU pair (`g` and `u` of the FFN), the residual `ADD` or the `CONV` of the
+  DeltaNet input. The result writer applies it. The intermediate vector does not go to the memory.
+- **Deferred norm.** A deferred `RMSNORM` keeps its row in the chip. The next GEMVs on this row normalize the
+  values when they quantize them. The arithmetic is the same as for the stored result.
+- **DeltaNet step.** The `GDN` step uses a copy of the state in URAM. `STATE_LOAD` reads the next state before
+  the step. The kernel writes the old state back during later GEMV passes.
+- **Output projection in the DeltaNet pass.** The GEMV on the step output (`ssm_out`, with its residual add) runs
+  in the pass of the step. This GEMV reads its weights in blocks of 256 columns. It starts when the first heads
+  come out of the step.
 
-Every fused form computes the same values as the plain command sequence.
+Each fused form gives the same values as the plain command sequence.
 
-### GEMV engines
+### 2.3 GEMV engines
 
-- Row `r` of a matrix lives in engine `r % 16`. All engines work on their rows in lockstep and write one result per
-  row to the activation buffer.
-- Every weight word (64 bytes) is processed per clock: 4 blocks of 32 weights for Q4_0, 2 blocks for Q8_0. Block
-  dot products are exact integer arithmetic. For Q4_0/Q8_0 the product with the two FP16 block scales (weight and
-  activation) is formed exactly on the significands and shifted into an 80-bit fixed-point accumulator; the row is
-  rounded to FP32 once at the end, so the result does not depend on the summation order.
-- The activation vector is quantized on the card exactly like ggml does for the matching weight type (`Q8_0` for
-  Q4_0/Q8_0 weights, `Q8_K` for Q5_K/Q6_K weights) and broadcast to all engines.
-- K-quants are handled per 256-weight super-block: one metadata word with the scales, then the quant words.
+- Row `r` of a matrix is in engine `r % 20`. All engines work on their rows at the same time. Each engine writes
+  one result for each row to the activation buffer.
+- An engine processes one weight word (64 bytes) for each clock: 4 blocks of 32 weights for Q4_0, 2 blocks for Q8_0.
+- The block dot products use exact integer arithmetic. For Q4_0 and Q8_0, the engine multiplies the two FP16 block
+  scales (weight and activation) exactly on the significands. It adds the product to an 80-bit fixed-point
+  accumulator. At the end of the row, it rounds to FP32 one time. The result does not depend on the sequence of the
+  additions.
+- The quantizer quantizes the activation vector as ggml does for the related weight type. It uses `Q8_0` for Q4_0
+  and Q8_0 weights, and `Q8_K` for Q5_K and Q6_K weights. All engines get the same quantized vector.
+- K-quants use super-blocks of 256 weights: one metadata word with the scales, then the quant words.
 
-### Weight layout (`gemvqw_layout.h`)
+### 2.4 Weight layout (`gemvqw_layout.h`)
 
-The host splits every GGUF row into groups: one 64-byte word with the FP16 block scales followed by the quant
-words (K-quants: a metadata word per super-block; for Q6_K three super-blocks share one metadata word and each adds
-a high-bits word to its quant words). Only the arrangement changes; the scale and quant values are the original
-bits. The same layout code is used by the backend, which keeps host and kernel in agreement.
+The host divides each GGUF row into groups. Each group has one 64-byte word with the FP16 block scales and then the
+quant words. K-quants have one metadata word for each super-block. For Q6_K, three super-blocks share one metadata
+word, and each super-block adds one word with the high bits.
 
-### Memory map (`fpga/connectivity.cfg`)
+Only the arrangement changes. The scale values and the quant values keep their original bits. The backend makes the
+layout with `gemvqw_layout.h`. The kernel reads the same layout.
+
+### 2.5 Memory map (`fpga/connectivity.cfg`)
 
 | Port | HBM | Content |
 | --- | --- | --- |
-| `w0`..`w15` | channel pairs `[2e:2e+1]` | weights of engine `e` (384 MiB arena each) |
-| `act` | channel 17 | activation buffer: inputs, results, resident FP32 weights and convolution states (64 MiB) |
+| `w0`..`w15` | even channels `2e` | weights of engine `e` (arena of 250 MiB) |
+| `w16`..`w19` | channels 1, 3, 5, 7 | weights of engines 16–19 (arena of 250 MiB) |
+| `act` | channel 17 | activation buffer: inputs, results, resident FP32 weights, convolution states (64 MiB) |
 | `act_rd` | channel 17 | second read port on the same buffer, for the convolution epilog while the pass writes `act` |
 | `cmds` | channel 17 | command list (4 KiB) |
-| `st0`..`st3` | channels 19, 21, 23, 25 | DeltaNet states, 512-byte rows striped over the four ports |
+| `st0`..`st3` | channels 19, 21, 23, 25 | DeltaNet states, 512-byte rows in sequence on the four ports |
 
-## The ggml backend (`llama.cpp/overlay/ggml/src/ggml-xrt`)
+With 16 engines (`GEMVQC16_ENGINES` 16), each engine port uses a channel pair `[2e:2e+1]` with an arena of
+384 MiB. The backend reads the number of ports and the bank size from the bitstream.
 
-- **Supported operations.** The backend claims single-token `MUL_MAT` nodes with supported weight formats, `RMS_NORM`
-  and `L2_NORM` (with the weight `MUL` that follows), vector `ADD` and `MUL`, SwiGLU (`GLU`), SiLU / sigmoid /
-  softplus (`UNARY`), the causal convolution (`CONCAT` + `SSM_CONV`), `GATED_DELTA_NET`, `ROPE`, `CONT` and the few
-  `GET_ROWS` / `CPY` / `SCALE` nodes that move recurrent state. Everything else is left to the CPU backend by the
-  ggml scheduler.
-- **Command lists.** A contiguous run of claimed nodes becomes one list. Inputs from host memory go to the input
-  region of the activation buffer, results stay on the card unless a later CPU split (or a graph output) reads them.
-- **Fusions.** While building a list the backend maps node patterns onto the fused commands above (GEMV groups,
-  SwiGLU pairs, epilogs, deferred norms, the complete DeltaNet step with its norms and gates, `STATE_LOAD` ahead
-  of the next step). `GGML_XRT_FEATURE_MASK` hides fusion bits of the kernel for diagnosis.
-- **Plan cache.** The analysis of a split (fusions, skipped nodes, use counts) is stored under a fingerprint of the
-  split's structure and reused on the next token; only the commands themselves are rebuilt.
-- **Weights** are repacked and uploaded the first time a tensor is used; nothing is cached on disk.
-- **Recurrent state.** The DeltaNet states and convolution states are allocated by a special buffer type (see patch
-  `0004`) and live only on the card. The CPU cannot touch them by accident: the address range is reserved without
-  access rights.
-- **Graph order** (patch `0006`) puts all input projections of a layer next to each other so they end up in one list.
-- **Verification** (`GGML_XRT_VERIFY_CALLS`) recomputes the checked operations with the reference implementation in
-  `gemvq_ref.h` and compares them with the card's results.
+## 3. ggml backend (`llama.cpp/overlay/ggml/src/ggml-xrt`)
 
-## Where the time goes
+- **Supported operations.** The backend accepts these nodes:
+  - `MUL_MAT` with one token and a supported weight format
+  - `RMS_NORM` and `L2_NORM` (with the next weight `MUL`), vector `ADD` and `MUL`
+  - SwiGLU (`GLU`), SiLU, sigmoid and softplus (`UNARY`)
+  - the causal convolution (`CONCAT` + `SSM_CONV`), `GATED_DELTA_NET`, `ROPE`, `CONT`
+  - the `GET_ROWS`, `CPY` and `SCALE` nodes that move the recurrent state.
 
-Measured with `GGML_XRT_TIMING` (72 minus 8 generated tokens, weights already uploaded), reference bitstream
-(kernel 100 MHz, HBM 346.6 MHz):
+  The ggml scheduler gives all other nodes to the CPU backend.
+- **Command lists.** The backend makes one list from each sequence of accepted nodes. It copies inputs from host
+  memory to the input region of the activation buffer. The results stay on the card. The backend copies a result
+  back only if a later CPU split or a graph output reads it.
+- **Fusions.** The backend maps node patterns to the fused commands of section 2.2. `GGML_XRT_FEATURE_MASK` hides
+  fusion bits of the kernel for diagnosis.
+- **Plan cache.** The backend stores the analysis of a split (fusions, skipped nodes, use counts) under a
+  fingerprint of the split structure. For the next token, it uses the stored analysis again. It makes only the
+  commands again.
+- **Weights.** The backend repacks and uploads a tensor when the graph uses it for the first time. There is no disk
+  cache. Q4_0 weights stay in the CPU repack buffer of llama.cpp (AVX2 layout) for the prompt kernels of the CPU.
+  The backend restores the GGUF rows from this buffer before the upload. The conversion has no loss.
+- **Output head.** The output head has 248,320 rows. It goes to the card only if it fits into the arenas next to
+  the layers. The backend calculates this one time from the sizes of all offloaded matrices and shows the result.
+- **Recurrent state.** A special buffer type (patch `0004`) keeps the DeltaNet states and the convolution states
+  on the card only. The CPU cannot access them: the address range has no access rights.
+- **Graph order.** Patch `0006` puts all input projections of a layer next to each other. They then go into one list.
+- **Kernel start.** If the scheduler of the driver is off (`ert_disable`), the backend writes the control registers
+  of the kernel directly. This takes 6 µs. The start through XRT takes 0.2 ms.
+- **Verification.** `GGML_XRT_VERIFY_CALLS` calculates the checked operations again with the reference
+  implementation in `gemvq_ref.h`. It compares the results with the results of the card.
 
-| Model | Per token (`llama-bench`) | Backend | Card busy | Weights per token | Launches per token |
+## 4. Time for each token
+
+Measured with `GGML_XRT_TIMING`: 72 tokens minus 8 tokens (the weights are on the card). Reference bitstream (20
+engines, kernel 94.8 MHz, HBM 347.9 MHz), direct start.
+
+| Model | Time for each token (`llama-bench`) | Card busy | Weights for each token | Launches for each token | Card throughput |
 | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-4B Q4_0 | 41.4 ms | 37.9 ms | 32.3 ms | 2.51 GB | 14 |
-| Qwen3.5-4B Q8_0 | 54.6 ms | 54.6 ms | 49.4 ms | 4.47 GB | 10 |
-| Qwen3.5-9B Q4_0 | 63.0 ms | 59.6 ms | 53.0 ms | 4.67 GB | 14 |
+| Qwen3.5-4B Q4_0 | 32.6 ms | 28.0 ms | 2.51 GB | 14 | 90 GB/s |
+| Qwen3.5-4B Q8_0 | 47.3 ms | 44.4 ms | 4.47 GB | 10 | 101 GB/s |
+| Qwen3.5-9B Q4_0 | 51.9 ms | 46.0 ms | 4.67 GB | 14 | 101 GB/s |
 
-"Backend" includes building the lists, copies and launches; the rest of the token time is CPU work outside the
-backend (attention core, the Q4_1 matrices, sampling). Per-token time and backend time come from different runs. The 16 engines can stream at most 16 × 64 B × 100 MHz =
-102.4 GB/s. Over a whole token the card reaches 78 GB/s (4B Q4_0) to 90 GB/s (4B Q8_0), computed as weights
-divided by card time, because the DeltaNet steps, norms and the fill and drain of each pass take time too.
+The other time (3–6 ms) is host work: the attention core of the 8 attention layers, the four Q4_1 matrices,
+copies and sampling.
 
-The HBM could deliver about three times more bandwidth than the 16 engine ports use. More engines would use it,
-but the design already fills most of the U50 (routed kernel: 56 % of the LUTs and 67 % of the DSPs of the user
-budget, routing in the HBM-side SLR is the limit). A 32-engine variant did not route; the sources also compile with
-20 engines (`-DGEMVQC16_ENGINES=20`, 31 of 32 HBM ports), which has been checked in C simulation only and was never
-built into a bitstream.
+The 20 engines read a maximum of 20 × 64 B × 94.8 MHz = 121 GB/s. The cycle trace (`GGML_XRT_TRACE=1`) shows the
+GEMV passes at 96 % of this value. The other card time has these causes:
 
-For Q4_0 the engines are also close to their compute limit: 16 × 128 products × 100 MHz = 205 GMAC/s, and the 4B
-model needs about 4.4 GMAC per token, about 88 % of the multipliers at the streaming floor. Levers, costs and a
-phased order for going faster without raising the clock are collected in [ROADMAP.md](ROADMAP.md).
+- the DeltaNet steps: for 4B Q4_0, 5 ms for each token. The `ssm_out` stream hides 2 ms of this time.
+- the norms
+- the start and the end of each pass.
+
+## 5. Limits of the design
+
+- **Area.** The routed kernel uses 64 % of the LUTs and 78 % of the DSPs of the user budget. A variant with 32
+  engines did not route. The LUTs limit the routing more than the DSPs.
+- **Bandwidth.** The HBM can supply 2.5 times the bandwidth that the 20 engine ports use. More engines do not fit.
+- **Compute.** For Q4_0, the engines are almost at their compute limit. The peak is 20 × 128 products × 94.8 MHz
+  = 243 GMAC/s. The 4B model needs 4.4 GMAC for each token. At the streaming limit, this is 88 % of the multipliers.
+
+These changes can increase the speed:
+
+- a higher clock
+- less work next to the weight stream
+- one weight read for more than one token.
+
+[ROADMAP.md](ROADMAP.md) gives the possible changes, their cost and their sequence.
