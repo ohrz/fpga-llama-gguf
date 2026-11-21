@@ -44,6 +44,9 @@ static_assert(16 % U == 0, "state units must divide 16");
 // FP lanes per unit and stage: 16 (one state word per clock) or 8 (one word in two clocks, half the operators).
 constexpr unsigned GL = GEMVQC_GDN_LANES, GH = 16 / GL;
 static_assert(GL == 8 || GL == 16, "GDN_LANES must be 8 or 16");
+// GEMVQC_GDN_TWO_PHASE (gemvqc16.h) 1: the two-phase step. Stage A computes y_j = (x . q + delta * (k . q)) * scale
+// with 16 lanes, so the output does not wait for the new state; S_j' = x + k * delta (the same bits as in the
+// one-phase step) is computed with GDN_LANES lanes when the row is written back, in the passes after the step.
 
 // Sum of a word's 16 products in the order of tree16 (= tree8 of the low half + tree8 of the high half): with 8
 // lanes the low half's sum is kept from the first clock of the word.
@@ -68,8 +71,12 @@ struct gdn_pass {
     float scale;
     bool gated;     // y leaves through the gated norm (gdn_gate)
     float rms_eps;
+#if GEMVQC_GDN_TWO_PHASE
+    unsigned wb_hk;  // key heads of the step whose rows are written back
+#endif
 };
 
+#if !GEMVQC_GDN_TWO_PHASE
 // Stage A of one unit: prefetch, then decay the state row, dot with k, emit the decayed words and delta for stage B.
 void stage_a(const vword * st_rd, vword * st, gdn_pass pass, const vword * kbuf, const vword * vbuf,
              const float * decay, const float * beta, unsigned unit, hls::stream<vword> & xs,
@@ -191,6 +198,158 @@ void stage_b(vword * st_wr, vword * st, gdn_pass pass, const vword * kbuf, const
 #define GEMVQC_GDN_UNIT(u)                                                                                        \
     gemvqc_gdn::stage_a(st##u##_rd, in[u], pass, ka[u], v[u], decay[u], beta[u], u, xs[u], ds[u]);              \
     gemvqc_gdn::stage_b(st##u##_wr, out[u], pass, kb[u], qb[u], xs[u], ds[u], ys[u])
+#else
+// Two-phase step, stage A of one unit (16 lanes, one state word per clock): prefetch, then per row x = S_j * d,
+// delta as in the one-phase step and y_j = (x . q + delta * (k . q)) * scale. Before the rows of a head, the eight
+// words of k pass the same lanes with d = 1: that row's x . q is k . q. The decayed words and delta go to stage B.
+void stage_a(const vword * st_rd, vword * st, gdn_pass pass, const vword * kbuf, const vword * qbuf,
+             const vword * vbuf, const float * decay, const float * beta, unsigned unit, hls::stream<vword> & xs,
+             hls::stream<float> & deltas, hls::stream<float> & ys) {
+    STATE_PF: for (unsigned i = 0; i < pass.pf_count; ++i) {
+#pragma HLS PIPELINE II=1
+        st[pass.pf_start + i] = st_rd[pass.pf_word + pass.pf_start + i];
+    }
+    unsigned w = 0, m = 0, h = 0, kh = 0, word = 0;
+    bool k_row = true;  // the k . q row of the head
+    float kq = 0.0f;
+    // The eight word sums of a row are added in the order of tree8 as they arrive: the word before, the pair
+    // before and the first half of the row wait here (three adders per dot product).
+    float k1 = 0.0f, k2 = 0.0f, k4 = 0.0f, q1 = 0.0f, q2 = 0.0f, q4 = 0.0f;
+    const unsigned hk = pass.hk, total = pass.hv * (UROWS + 1U) * SW;
+    const float scale = pass.scale;
+    GDN_A: for (unsigned c = 0; c < total; ++c) {
+#pragma HLS PIPELINE II=1 style=frp
+        const vword kw = kbuf[kh * SW + w], qw = qbuf[kh * SW + w];
+        const vword s = k_row ? kw : st[word];
+        const float d = k_row ? 1.0f : decay[h];
+        vword x = 0;
+        float xk[16], xq[16];
+#pragma HLS ARRAY_PARTITION variable=xk complete
+#pragma HLS ARRAY_PARTITION variable=xq complete
+        for (unsigned l = 0; l < 16; ++l) {
+#pragma HLS UNROLL
+            const float xv = word_lane_float(s, l) * d;
+            set_lane(x, l, xv);
+            xk[l] = xv * word_lane_float(kw, l);
+            xq[l] = xv * word_lane_float(qw, l);
+        }
+        const float wk = tree8(xk) + tree8(xk + 8), wq = tree8(xq) + tree8(xq + 8);
+        const float pair_k = k1 + wk, pair_q = q1 + wq;      // at odd w
+        const float half_k = k2 + pair_k, half_q = q2 + pair_q;  // at w = 3 and 7
+        const float row_k = k4 + half_k, row_q = q4 + half_q;    // at w = 7
+        k1 = wk;
+        q1 = wq;
+        if (w % 4U == 1U) {
+            k2 = pair_k;
+            q2 = pair_q;
+        }
+        if (w == 3U) {
+            k4 = half_k;
+            q4 = half_q;
+        }
+        if (!k_row) {
+            xs.write(x);
+            ++word;
+        }
+        if (w == SW - 1U) {
+            w = 0;
+            if (k_row) {
+                kq = row_q;
+                k_row = false;
+            } else {
+                const unsigned j = m * U + unit;
+                const float vj = word_lane_float(vbuf[h * SW + j / 16U], j % 16U);
+                const float delta = (vj - row_k) * beta[h];
+                deltas.write(delta);
+                ys.write((row_q + delta * kq) * scale);
+                if (m == UROWS - 1U) {
+                    m = 0;
+                    ++h;
+                    kh = kh == hk - 1U ? 0U : kh + 1U;
+                    k_row = true;
+                } else {
+                    ++m;
+                }
+            }
+        } else {
+            ++w;
+        }
+    }
+}
+
+// Two-phase step, stage B of one unit. Write-back of the step before: S' = x + k * delta from the decayed rows in
+// the output buffer and delta per row, GH clocks per word, to the writer. Then, in a pass with a step, the decayed
+// rows and their delta go to the output buffer and dl (the command processor completes the write-back before it
+// loads the next step's k).
+void stage_b(vword * st, float * dl, gdn_pass pass, const vword * kbuf, hls::stream<vword> & xs,
+             hls::stream<float> & deltas, hls::stream<vword> & ws) {
+    unsigned w = pass.wb_start % SW, row = pass.wb_start / SW, kh = row / UROWS;
+    WB_KEY_HEAD: while (kh >= pass.wb_hk) {
+#pragma HLS LOOP_TRIPCOUNT max=31
+        kh -= pass.wb_hk;
+    }
+    float delta = 0.0f;
+    vword x = 0, kw = 0, out = 0;
+    const unsigned hk = pass.wb_hk;
+    GDN_WB: for (unsigned c = 0; c < pass.wb_count * GH; ++c) {
+#pragma HLS PIPELINE II=1 style=frp
+        const unsigned half = c % GH;
+        if (half == 0) {
+            x = st[pass.wb_start + c / GH];
+            kw = kbuf[kh * SW + w];
+            delta = dl[row];
+        }
+        for (unsigned l = 0; l < GL; ++l) {
+#pragma HLS UNROLL
+            const float u = word_lane_float(x, l) + word_lane_float(kw, l) * delta;
+            out = (out >> 32) | (vword(gemvqc_ops::lane_bits(u)) << 480);
+        }
+        if (GH > 1) {
+            x >>= 32 * GL;
+            kw >>= 32 * GL;
+        }
+        if (half == GH - 1U) {
+            ws.write(out);
+            if (w == SW - 1U) {
+                w = 0;
+                ++row;
+                if (row % UROWS == 0) kh = kh == hk - 1U ? 0U : kh + 1U;
+            } else {
+                ++w;
+            }
+        }
+    }
+    // delta arrives some clocks after its row: it is taken when it is there, the rest behind the rows.
+    const unsigned rows = pass.hv * UROWS;
+    unsigned got = 0;
+    GDN_STORE: for (unsigned c = 0; c < rows * SW; ++c) {
+#pragma HLS PIPELINE II=1
+        st[c] = xs.read();
+        float dv;
+        if (got < rows && deltas.read_nb(dv)) dl[got++] = dv;
+    }
+    GDN_STORE_DELTA: while (got < rows) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT max=128
+        dl[got++] = deltas.read();
+    }
+}
+
+// Writes the rows of the write-back to the state port.
+void state_writer(vword * st_wr, gdn_pass pass, hls::stream<vword> & ws) {
+    STATE_WB: for (unsigned i = 0; i < pass.wb_count; ++i) {
+#pragma HLS PIPELINE II=1
+        st_wr[pass.wb_word + pass.wb_start + i] = ws.read();
+    }
+}
+
+// The processes of unit u inside a dataflow region that has the state ports, the buffers in/out/dl, the step inputs
+// ka, kb, qb, v, decay, beta, the streams xs/ds/ys/ws and the pass description `pass`.
+#define GEMVQC_GDN_UNIT(u)                                                                                        \
+    gemvqc_gdn::stage_a(st##u##_rd, in[u], pass, ka[u], qb[u], v[u], decay[u], beta[u], u, xs[u], ds[u], ys[u]);  \
+    gemvqc_gdn::stage_b(out[u], dl[u], pass, kb[u], xs[u], ds[u], ws[u]);                                        \
+    gemvqc_gdn::state_writer(st##u##_wr, pass, ws[u])
+#endif
 static_assert(U == 4, "the GEMV pass of gemvqc16 is written out for four state ports");
 
 // Per-head scales of `heads` rows of 128 floats in buf (8 words each), exactly as the RMSNORM opcode (rownorm) does

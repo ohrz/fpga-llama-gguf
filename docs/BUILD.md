@@ -110,6 +110,10 @@ Data of the reference build:
 - The DeltaNet units use 8 floating-point lanes (`GEMVQC_GDN_LANES` in `fpga/src/gemvqc_gdn.h`). 16 lanes give
   bit-identical results and save 2 ms for each token of the 4B model. They need 560 more DSPs (HLS estimate). We did
   not build this variant.
+- The two-phase DeltaNet step is a build switch (`GEMVQC_GDN_TWO_PHASE` in `fpga/src/gemvqc16.h`, default 0). It
+  saves the same time with 356 more DSPs and 23,800 more LUTs (HLS estimate). The state has the same bits. The
+  output can be different in the last bits. We tested this variant in the C simulation, in the RTL co-simulation
+  and in the emulator. We did not build a bitstream with it. Refer to [ROADMAP.md](ROADMAP.md), item A7.
 
 HBM connections (`fpga/connectivity.cfg`):
 

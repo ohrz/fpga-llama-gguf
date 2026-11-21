@@ -133,8 +133,12 @@
 // bit 13 packed Q6_K layout (three super-block metas per word, see gemvqw_layout.h) | bit 14 TRACE |
 // bit 15 GDN_WITH_OUT and the gated norm in the step's pass (z read when the step starts)
 #define GEMVQC_FEATURES (0x6B51FFF9U | (GEMVQ_HAS_Q6_K ? 2U : 0U) | (GEMVQ_HAS_Q4_1 ? 4U : 0U))
-// 0x6B52 marker | bit 0 SILU_MUL with the sigmoid flag and strided g | bit 1 GDN_L2_SUM
-#define GEMVQC_FEATURES2 0x6B520003U
+// 0x6B52 marker | bit 0 SILU_MUL with the sigmoid flag and strided g | bit 1 GDN_L2_SUM |
+// bit 2 two-phase GDN step (GEMVQC_GDN_TWO_PHASE, see gemvqc_gdn.h; the commands are the same)
+#ifndef GEMVQC_GDN_TWO_PHASE
+#define GEMVQC_GDN_TWO_PHASE 0
+#endif
+#define GEMVQC_FEATURES2 (0x6B520003U | (GEMVQC_GDN_TWO_PHASE ? 4U : 0U))
 #define GEMVQC_SILU_MUL_SIGMOID 1U
 extern "C" int gemvqc16(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<512> * w2,
                         const ap_uint<512> * w3, const ap_uint<512> * w4, const ap_uint<512> * w5,

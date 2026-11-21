@@ -345,6 +345,9 @@ void gemv_core(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<5
                const gemvqc_ops::vword v[gemvqc_gdn::U][gemvqc_gdn::MAX_HEADS * gemvqc_gdn::SW],
                const float decay[gemvqc_gdn::U][gemvqc_gdn::MAX_HEADS],
                const float beta[gemvqc_gdn::U][gemvqc_gdn::MAX_HEADS], gemvqc_gdn::gdn_pass pass,
+#if GEMVQC_GDN_TWO_PHASE
+               float dl[gemvqc_gdn::U][gemvqc_gdn::MAX_HEADS * gemvqc_gdn::UROWS],
+#endif
                const gemvqc_ops::vword * zbuf, const gemvqc_ops::vword * wbuf, unsigned gdn_y, bool x_from_gdn
                , const gemvqc_ops::vword * act_rd) {
     hls::stream<ap_uint<512>> xin;
@@ -367,6 +370,10 @@ void gemv_core(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<5
 #pragma HLS STREAM variable=xs depth=64
 #pragma HLS STREAM variable=ds depth=16
 #pragma HLS STREAM variable=ys depth=32
+#if GEMVQC_GDN_TWO_PHASE
+    hls::stream<gemvqc_ops::vword> ws[gemvqc_gdn::U];
+#pragma HLS STREAM variable=ws depth=16
+#endif
     // The step's output: gy to act (a whole step deep, see store_rows), gx to the quantizer (x_from_gdn).
     hls::stream<gemvqc_ops::vword> gy, gx;
 #pragma HLS STREAM variable=gy depth=256
@@ -587,7 +594,13 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
 #pragma HLS ARRAY_PARTITION variable=gdn_decay complete dim=1
 #pragma HLS ARRAY_PARTITION variable=gdn_beta complete dim=1
     // State of one GDN step on chip: gdn_in holds the old rows (port u's share in gdn_in[u]), gdn_out the new ones.
+    // (Two-phase step: gdn_out holds the decayed rows and gdn_dl delta per row until the write-back.)
     gemvqc_ops::vword gdn_in[U][BUF_WORDS], gdn_out[U][BUF_WORDS];
+#if GEMVQC_GDN_TWO_PHASE
+    float gdn_dl[U][MAX_HEADS * UROWS];
+#pragma HLS ARRAY_PARTITION variable=gdn_dl complete dim=1
+    unsigned wb_hk = 1;
+#endif
 #pragma HLS ARRAY_PARTITION variable=gdn_in complete dim=1
 #pragma HLS ARRAY_PARTITION variable=gdn_out complete dim=1
 #pragma HLS BIND_STORAGE variable=gdn_in type=ram_2p impl=uram
@@ -630,6 +643,9 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
         pass.scale = 0.0f;
         pass.gated = false;
         pass.rms_eps = 0.0f;
+#if GEMVQC_GDN_TWO_PHASE
+        pass.wb_hk = wb_hk;
+#endif
         unsigned step_y = 0, step_dst = 0;
         bool out_gemv = false;  // the pass's GEMV is the column-blocked one on the step's output
         if (c >= n_cmds || status != 0) {
@@ -728,7 +744,12 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
                     const unsigned wb_left = wb_total - wb_done;
                     const unsigned pf_left = pf_valid ? pf_hv * UROWS * SW - pf_done : 0U;
                     const bool clash = wb_left != 0 && pf_src < wb_dst + wb_rows && wb_dst < pf_src + pf_hv * S;
-                    pass.wb_count = wb_left < budget ? wb_left : budget;
+#if GEMVQC_GDN_TWO_PHASE
+                    const unsigned wb_budget = budget / GH;  // the write-back computes: GH clocks per word
+#else
+                    const unsigned wb_budget = budget;
+#endif
+                    pass.wb_count = wb_left < wb_budget ? wb_left : wb_budget;
                     pass.pf_count = clash ? 0U : (pf_left < budget - pass.wb_count ? pf_left : budget - pass.wb_count);
                 }
             } else if (opcode == GEMVQC_OP_RMSNORM) {
@@ -813,7 +834,12 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
                 // The write-back still pending and this step's prefetch run at the same time in the step's pass;
                 // if they touch the same rows, a pass with only the write-back goes first (the step is not consumed).
                 const bool wb_pending = wb_done != wb_total;
+#if GEMVQC_GDN_TWO_PHASE
+                // The write-back needs k and delta of its step: it always ends before this step is loaded.
+                const bool clash = wb_pending;
+#else
                 const bool clash = wb_pending && ext[0] < wb_dst + wb_rows && wb_dst < ext[0] + rows;
+#endif
                 if (c + slots > n_cmds || hv == 0 || hv > MAX_HEADS || hk == 0 || hk > hv || (hv % hk) != 0 ||
                     (cmd[2] % 16U) != 0 || (cmd[3] % 16U) != 0 || (cmd[4] % 16U) != 0 || (cmd[5] % 16U) != 0 ||
                     (cmd[6] % 16U) != 0 || (cmd[7] % 16U) != 0 || (ext[0] % U) != 0 || (ext[1] % U) != 0 ||
@@ -936,7 +962,11 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
                       n == 0 ? 0U : cols / 16U,
                       mem[0], mem[1], mem[2], mem[3], n, out_gemv ? 8U : cols / 32U, act, gbuf, rbuf
                       , st0_rd, st0_wr, st1_rd, st1_wr, st2_rd, st2_wr, st3_rd, st3_wr, gdn_in, gdn_out, gdn_ka,
-                      gdn_kb, gdn_qb, gdn_v, gdn_decay, gdn_beta, pass, buf_b, buf_c, step_y, out_gemv
+                      gdn_kb, gdn_qb, gdn_v, gdn_decay, gdn_beta, pass,
+#if GEMVQC_GDN_TWO_PHASE
+                      gdn_dl,
+#endif
+                      buf_b, buf_c, step_y, out_gemv
                       , act_rd);
             hls::fence(act, w0, st0_rd, st0_wr, ev);
             ev.write(trace_tag(c, TRACE_PASS_END));
@@ -949,6 +979,9 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
                 wb_rows = pass.hv * S;
                 wb_total = pass.hv * UROWS * SW;
                 wb_done = 0;
+#if GEMVQC_GDN_TWO_PHASE
+                wb_hk = pass.hk;
+#endif
             }
         }
         c += advance;

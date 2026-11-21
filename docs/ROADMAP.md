@@ -90,16 +90,49 @@ The K-quant matrices are 27 % of the stream. A change that makes only Q4_0 two t
 | ID | Change | Estimated gain (4B Q4_0) | Cost |
 | --- | --- | --- | --- |
 | K1 | More timing margin in HLS (pipeline stages in the DeltaNet units and the command loop) | +5 % (clock 100 MHz) | one link. A test build without C5 did not route: 2 % more LUTs, congestion level 7 |
-| A7 | DeltaNet step in two phases (refer to the text below the table) | −2 ms for each token | +130 to 190 DSPs (estimate). Possible only after C5 |
-| A5 | DeltaNet units with 16 lanes | −2 to −3 ms for each token | +560 DSPs. A7 replaces most of this change |
+| A7 | DeltaNet step in two phases (refer to the text below the table) | −2 ms for each token | +356 DSPs, +23,800 LUTs (HLS estimate). The kernel source has it as a build switch. Possible only after C5 |
+| A5 | DeltaNet units with 16 lanes | −2 ms for each token | +560 DSPs and +24,900 LUTs (HLS estimate). A7 gives the same step time with fewer DSPs |
 | A6 | Activations in the chip (URAM) for norms and element-wise passes | −1 to −2 ms for each token | URAM is 70 % free |
 | A4 | `ssm_alpha`, `ssm_beta` and K/V projections in the qkv group | less than 0.5 ms | small |
 
 **A7 in detail.** The step calculates the output from the new state `S' = x + k·δ`. The two-phase form calculates
-the output as `(x·q) + δ·(k·q)`. The output then does not wait for the new state. The output path can use 16 lanes.
-The state update stays at 8 lanes and runs behind the output. A C++ study with 1.6 million values gave the same
-accuracy for the two forms: mean relative error 1.18e-07 (current) and 1.14e-07 (two phases). The change is not
-in the kernel.
+the output as `(x·q) + δ·(k·q)`. The output then does not wait for the new state. A C++ study with 1.6 million
+values gave the same accuracy for the two forms: mean relative error 1.18e-07 (current) and 1.14e-07 (two phases).
+
+The kernel source has this form as a build switch (`GEMVQC_GDN_TWO_PHASE` in `fpga/src/gemvqc16.h`, default 0).
+The default kernel does not change: its HLS estimate is the same as before.
+
+- **Output path.** Stage A of each DeltaNet unit uses 16 lanes. It calculates `x`, `δ` and the output. Before the
+  rows of a head, the words of `k` go through the same lanes. This gives `k·q` without more multipliers.
+- **State update.** Stage B keeps the decayed rows and `δ`. It calculates `S' = x + k·δ` with 8 lanes when it writes
+  the rows to the HBM. This occurs in the passes after the step, next to the engines. The write-back of a step is
+  complete before the kernel loads the next step.
+- **Commands.** The command list is the same. The backend does not change.
+
+Results:
+
+| Test | Result |
+| --- | --- |
+| C simulation of the kernel test bench | 193 of 193 cases agree |
+| State after each of the 84 launches of the test bench | the same bits as with the default kernel |
+| Output values | some values are different in the last bits. All tolerance checks agree |
+| RTL co-simulation of the DeltaNet sequence (20 engines) | 27 of 27 cases agree |
+| Emulator, llama.cpp `b9972` and `b12602` | 742 and 754 checked operations agree. The text is the same |
+| RTL co-simulation of a test list: two layers with 16 heads, commands with fusions (16 engines) | The results agree. 46,345 cycles. The default kernel needs 52,760 cycles |
+| The same test list, commands without fusions | 78,029 cycles. The default kernel needs 86,273 cycles |
+| Pass of the step in this test list (16 heads) | 5,967 cycles. The default kernel needs 10,089 cycles |
+| HLS estimate | +356 DSPs, +23,800 LUTs, +33,700 FFs, +8 BRAMs. The clock estimate is the same |
+
+One head needs 264 cycles in the step. The default kernel needs 512 cycles. The 4B model has 24 DeltaNet layers
+with 32 heads. Thus the estimated gain is 190,000 cycles or 2.0 ms for each token at 94.8 MHz. This is an estimate
+from the cycle count. It is not a measurement on the card.
+
+The state update needs two clocks for each word. The default kernel needs one clock to write a word. If the GEMV
+passes after a step are too short, the kernel adds a pass for the remaining words. In the test list, this pass
+adds 1,817 cycles after the last command. The GEMV passes of a 4B layer are much longer than those of the test list.
+
+The first estimate of the cost (130 to 190 DSPs) was too low. The output path needs three multipliers for each
+lane, not two. We did not build a bitstream with this switch. The design has no free area for it before C5.
 
 ### 3.2 Less work outside the card
 
@@ -276,7 +309,7 @@ Reasons for this sequence:
 
 1. Steps 1 and 2 need no change of the kernel function. Step 2 decides between C2, C6 and the current limit.
 2. C5 gives no gain alone. But each later step needs its area. A K1 build without C5 did not route.
-3. Step 4 needs little area. It decreases the card time next to the stream.
+3. Step 4 decreases the card time next to the stream. A7 needs 356 DSPs and 23,800 LUTs (HLS estimate).
 4. Step 5 gives the largest gain. It needs the area of step 3 and the result of step 2.
 5. P2 needs multipliers that are not free in the current design.
 
