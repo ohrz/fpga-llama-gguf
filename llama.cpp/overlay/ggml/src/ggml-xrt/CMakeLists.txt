@@ -27,6 +27,12 @@ target_include_directories(ggml-xrt PRIVATE "${XRT_PATH}/include" "${GGML_XRT_GE
 target_link_libraries(ggml-xrt PRIVATE "${XRT_CORE_LIB}" Threads::Threads)
 target_compile_features(ggml-xrt PRIVATE cxx_std_17)
 
+# llama.cpp b12602 gave ggml_rope_yarn_corr_dims one more argument (truncate).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-impl.h" GGML_XRT_IMPL_H)
+if (GGML_XRT_IMPL_H MATCHES "ggml_rope_get_truncate")
+    target_compile_definitions(ggml-xrt PRIVATE GGML_XRT_ROPE_TRUNCATE)
+endif()
+
 # Optional: run the kernel as its HLS C++ model on the host (GGML_XRT_EMULATE=1, no card needed). The model is
 # compiled from the kernel sources against the Vitis HLS headers (ap_int.h, hls_stream.h).
 set(GGML_XRT_EMULATE_INCLUDE "" CACHE PATH "Vitis HLS include directory (contains ap_int.h); enables GGML_XRT_EMULATE=1")

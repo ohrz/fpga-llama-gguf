@@ -1,0 +1,36 @@
+# This patch modifies llama.cpp, which is licensed under the MIT License
+# (Copyright (c) 2023-2026 The ggml authors). The modified files stay under that license, see THIRD-PARTY-NOTICES.md.
+# Apply with: git apply <patch>  (from the root of llama.cpp commit 418fe97b5f01b11eeb89f30d8a0459433edbf1d2, tag b12602)
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 5b05fc6..b8e1726 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -303,6 +303,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
+     cb(Kcur, "Kcur", il);
+     cb(Vcur, "Vcur", il);
+ 
++    // fpga-llama-gguf: keep the three projections contiguous in the graph (one offload split).
++    ggml_build_forward_expand(gf, Qcur_full);
++    ggml_build_forward_expand(gf, Kcur);
++    ggml_build_forward_expand(gf, Vcur);
++
+     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+         ggml_element_size(Qcur_full) * n_embd_head * 2,
+         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+@@ -389,9 +394,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+                 ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+     } else {
+         beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
++        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
++        // fpga-llama-gguf: put all input projections of the layer into the graph right after the norm, so an
++        // offload backend receives them as one contiguous split instead of one split per projection.
++        ggml_build_forward_expand(gf, qkv_mixed);
++        ggml_build_forward_expand(gf, z);
++        ggml_build_forward_expand(gf, beta);
++        ggml_build_forward_expand(gf, alpha);
+         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+ 
+-        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     }
+     cb(beta, "beta", il);

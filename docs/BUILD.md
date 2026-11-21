@@ -16,7 +16,7 @@ You need the two items to run on the card.
 | XRT | 2.26.0, upstream commit `11169ba504943e72482836feb6bd13af37350bdf` | headers and `libxrt_coreutil` for the build, `xocl` driver at run time |
 | Vitis / Vivado / Vitis HLS | **2025.2** | only for the bitstream and the emulator |
 | OS / compiler | Ubuntu 24.04, GCC 13.3, CMake 3.28, Ninja 1.11, git | other Linux toolchains are not tested |
-| llama.cpp | `c92e806d1c81091c9035edce99c35374da1b465e` | `scripts/build_llama.sh` downloads this commit |
+| llama.cpp | `c92e806d1c81091c9035edce99c35374da1b465e` (release `b9972`) | `scripts/build_llama.sh` downloads this commit. `LLAMA_CPP_VERSION=b12602` selects commit `418fe97b5f01b11eeb89f30d8a0459433edbf1d2`, tested only in the emulator |
 
 1. Install the U50 platform and XRT. Use the Alveo U50 documentation of AMD.
 2. Make sure that XRT finds the card. `xbutil examine` must show the U50.

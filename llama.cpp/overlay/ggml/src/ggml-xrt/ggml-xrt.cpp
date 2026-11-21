@@ -906,7 +906,11 @@ static std::vector<float> xrt_rope_cache(const ggml_tensor * op) {
     memcpy(&sections, (const int32_t *) op->op_params + 11, sizeof(int) * 4);
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_dims[2];
+#ifdef GGML_XRT_ROPE_TRUNCATE  // llama.cpp b12602: one more argument (set by CMakeLists.txt from ggml-impl.h)
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(op), corr_dims);
+#else
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+#endif
     const int32_t * pos = static_cast<const int32_t *>(op->src[1]->data);
     const int64_t ne0 = op->ne[0], ne2 = op->ne[2];
     std::vector<float> cache(static_cast<size_t>(ne0));
@@ -973,7 +977,8 @@ static bool xrt_qc_supports_gdn(const ggml_tensor * op) {
          op->src[1]->type == GGML_TYPE_I32) ||
         (op->op == GGML_OP_CPY && xrt_rs_buffer_of(op->src[1]) != nullptr && op->src[0]->type == GGML_TYPE_F32 &&
          op->src[1]->type == GGML_TYPE_F32) ||
-        (op->op == GGML_OP_SCALE && xrt_rs_buffer_of(op->src[0]) != nullptr && op->type == GGML_TYPE_F32)) {
+        (op->op == GGML_OP_SCALE && xrt_rs_buffer_of(op->src[0]) != nullptr && op->type == GGML_TYPE_F32) ||
+        (op->op == GGML_OP_FILL && xrt_rs_buffer_of(op->src[0]) != nullptr && op->type == GGML_TYPE_F32)) {
         return true;
     }
     const ggml_tensor * a = op->src[0];
@@ -989,6 +994,12 @@ static bool xrt_qc_supports_gdn(const ggml_tensor * op) {
                    (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) &&
                    n_dims % 32 == 0 && n_dims <= 128 && n_dims <= op->ne[0] && op->ne[0] % 16 == 0;
         }
+        case GGML_OP_SCALE:
+            // x * s of a norm. llama.cpp b12602 writes the L2 norm of q and k as SCALE(RMS_NORM(x, eps / n), 1 / sqrt(n))
+            // = x / sqrt(sum + eps). The L2 norm inside the GDN command is x / max(sqrt(sum), eps): not the same for
+            // small sums, so this form runs as an RMSNORM command with the constant weight s.
+            return a->op == GGML_OP_RMS_NORM && ggml_get_op_params_f32(op, 1) == 0.0f && xrt_qc_token_tensor(op) &&
+                   xrt_qc_token_tensor(a) && op->ne[0] % 16 == 0;
         case GGML_OP_CONT:  // copy of strided rows (a UNARY copy, or folded into the unary that reads it)
             return xrt_qc_token_tensor(op) && xrt_qc_strided_rows(a) && ggml_nelements(op) == ggml_nelements(a);
         case GGML_OP_MUL:
@@ -1725,7 +1736,7 @@ static const uint8_t * xrt_qc_state_row(const ggml_tensor * gr) {
     return static_cast<const uint8_t *>(gr->src[0]->data) + size_t(id) * gr->src[0]->nb[1];
 }
 
-// Host-side state ops (prompts, sequence starts): GET_ROWS from, CPY into and SCALE of XRT_RS tensors.
+// Host-side state ops (prompts, sequence starts): GET_ROWS from, CPY into, SCALE and FILL of XRT_RS tensors.
 static void xrt_qc_state_op(xrt_backend_context * ctx, ggml_tensor * node) {
     if (node->op == GGML_OP_GET_ROWS) {
         const ggml_tensor * src = node->src[0];
@@ -1761,6 +1772,12 @@ static void xrt_qc_state_op(xrt_backend_context * ctx, ggml_tensor * node) {
                     xrt_rs_io(ctx, e, within, reinterpret_cast<uint8_t *>(v.data() + k), size_t(dst->ne[0]) * sizeof(float), true);
                     k += size_t(dst->ne[0]);
                 }
+    } else if (node->op == GGML_OP_FILL) {  // FILL in place (llama.cpp b12602 clears states with it)
+        if (!ggml_is_contiguous(node)) throw std::runtime_error("XRT_RS fill needs a contiguous view");
+        std::vector<float> v(size_t(ggml_nelements(node)), ggml_get_op_params_f32(node, 0));
+        size_t within = 0;
+        const auto & e = xrt_rs_at(node, node->data, &within);
+        xrt_rs_io(ctx, e, within, reinterpret_cast<uint8_t *>(v.data()), v.size() * sizeof(float), true);
     } else {  // SCALE in place: y = x * s + b
         const float s = ggml_get_op_params_f32(node, 0), b = ggml_get_op_params_f32(node, 1);
         if (!ggml_is_contiguous(node)) throw std::runtime_error("XRT_RS scale needs a contiguous view");
@@ -2271,17 +2288,34 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                 list.checks.push_back({XRT_QC_OP_GEMV, node, offs[0], 0, y_off, unsigned(cols), 0.0f});
                 break;
             }
+            case GGML_OP_SCALE:
+                if (xrt_rs_buffer_of(a) != nullptr) {  // a state op
+                    xrt_qc_flush(ctx, list);
+                    xrt_scoped_ns state_timer{g_xrt_timing.state_ns};
+                    xrt_qc_state_op(ctx, node);
+                    break;
+                }
+                [[fallthrough]];
             case GGML_OP_RMS_NORM:
             case GGML_OP_L2_NORM:
             case GGML_OP_MUL: {
-                const ggml_tensor * norm = node->op == GGML_OP_MUL ? a : node;
-                const bool weight_mul = node->op == GGML_OP_MUL && a->op == GGML_OP_RMS_NORM && i > 0 &&
+                // The weight of an RMS_NORM: the next node, a MUL by a weight vector or a SCALE (a constant weight).
+                const bool scale = node->op == GGML_OP_SCALE;
+                const ggml_tensor * norm = node->op == GGML_OP_MUL || scale ? a : node;
+                const bool weight_mul = (node->op == GGML_OP_MUL || scale) && a->op == GGML_OP_RMS_NORM && i > 0 &&
                                         cgraph->nodes[i - 1] == a && use_count(a) == 1;
-                if (node->op != GGML_OP_MUL && next != nullptr && next->op == GGML_OP_MUL && next->src[0] == node &&
-                    node->op == GGML_OP_RMS_NORM && use_count(node) == 1) {
-                    break;  // emitted with the weight MUL
+                if (node->op == GGML_OP_RMS_NORM && next != nullptr && (next->op == GGML_OP_MUL || next->op == GGML_OP_SCALE) &&
+                    next->src[0] == node && use_count(node) == 1) {
+                    break;  // emitted with the weight MUL or the SCALE
                 }
-                if (node->op != GGML_OP_MUL || weight_mul) {
+                if (scale && !weight_mul) {
+                    fprintf(stderr, "XRT: SCALE %s is not behind its RMS_NORM\n", node->name);
+                    return GGML_STATUS_FAILED;
+                }
+                std::vector<float> cs;  // SCALE: the constant as a weight row
+                if (scale) cs.assign(size_t(norm->ne[0]), ggml_get_op_params_f32(node, 0));
+                const void * w_data = scale ? static_cast<const void *>(cs.data()) : (b != nullptr ? b->data : nullptr);
+                if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_L2_NORM || weight_mul) {
                     const unsigned row = unsigned(norm->ne[0]), rows = unsigned(n / row);
                     const unsigned flags = (norm->op == GGML_OP_L2_NORM ? XRT_QC_NORM_L2 : 0U) |
                                            (weight_mul ? 0U : XRT_QC_NORM_NO_WEIGHT);
@@ -2290,9 +2324,10 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                     const bool strided = !xrt_qc_token_tensor(nx);  // xrt_qc_supports_gdn: then strided rows
                     const unsigned stride_words = strided ? unsigned(nx->nb[1] / 64) : 0U;
                     std::vector<xrt_qc_operand> ops = {{nx, nx->data, strided ? xrt_qc_rows_span(nx) : n}};
-                    if (weight_mul) ops.push_back({b, b->data, row});
+                    if (weight_mul) ops.push_back({b, w_data, row});
                     const bool defer = rows == 1 && !strided && defer_ok.count(node) != 0;
                     const auto offs = xrt_qc_operands(ctx, list, ops, n, defer && verify ? 2 : 1);
+                    if (scale) list.owned.push_back(std::move(cs));  // as the rope cache: the address stays unique
                     const unsigned y_off = xrt_qc_output(list, node, n);
                     const unsigned w_off = weight_mul ? offs[1] : 0U;
                     if (defer) {
@@ -2727,7 +2762,7 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
             }
             case GGML_OP_GET_ROWS:
             case GGML_OP_CPY:
-            case GGML_OP_SCALE:
+            case GGML_OP_FILL:
                 xrt_qc_flush(ctx, list);
                 {
                     xrt_scoped_ns state_timer{g_xrt_timing.state_ns};

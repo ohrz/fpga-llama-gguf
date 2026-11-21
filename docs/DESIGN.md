@@ -9,6 +9,52 @@ The kernel keeps the quantized weights in HBM. 20 engines read them. Each engine
 64-byte word for each clock. The weights stay in the original GGUF quantization. Because of this, the card
 calculates the same model as the CPU.
 
+### 1.1 Data flow for one token
+
+```mermaid
+flowchart TD
+  subgraph HOST["Host: llama.cpp"]
+    G["ggml graph for one token"] --> SCH["ggml scheduler: splits"]
+    SCH -->|"supported nodes"| BE["XRT backend: plan cache, fusions, command list"]
+    SCH -->|"other nodes"| CPU["CPU backend: attention core, Q4_1 matrices, sampler"]
+  end
+  subgraph CARD["Alveo U50: kernel gemvqc16"]
+    CMD["Command loop: max. 128 commands for each launch"]
+    QZ["Quantizer: Q8_0 or Q8_K, deferred norm"]
+    ENG["20 GEMV engines: 64 bytes for each clock"]
+    RW["Result writer: SwiGLU, residual add, convolution"]
+    GDN["4 DeltaNet units: state copy in URAM"]
+    EW["Element-wise unit: norm, add, mul, unary, RoPE"]
+  end
+  subgraph MEM["HBM2: 8 GB"]
+    W["w0..w19: weights, 20 x 250 MiB"]
+    ACT["act: activations 64 MiB, cmds: 4 KiB"]
+    ST["st0..st3: DeltaNet states"]
+  end
+  BE -->|"inputs, command list, direct start"| ACT
+  ACT --> CMD
+  CMD --> QZ --> ENG --> RW --> ACT
+  W -->|"max. 121 GB/s"| ENG
+  CMD --> GDN
+  ST <--> GDN
+  GDN -->|"step output"| ENG
+  CMD --> EW
+  EW <--> ACT
+  ACT -->|"results that the CPU reads"| CPU
+  CPU -->|"next split"| BE
+```
+
+The sequence for one token:
+
+1. llama.cpp makes the ggml graph. The scheduler divides it into splits.
+2. The backend makes one command list from each split of supported nodes.
+3. The backend writes the inputs and the list to HBM and starts the kernel.
+4. The kernel runs the commands. The engines read the weights from 20 HBM channels. The results stay in HBM.
+5. The backend reads back only the results that the CPU reads.
+6. The CPU calculates the attention core, the Q4_1 matrices and the sampler.
+
+A token of a Q4_0 model needs 14 of these cycles. A token of the Q8_0 model needs 10.
+
 ## 2. Kernel (`fpga/src`)
 
 ### 2.1 Command list
@@ -93,10 +139,10 @@ With 16 engines (`GEMVQC16_ENGINES` 16), each engine port uses a channel pair `[
 
 - **Supported operations.** The backend accepts these nodes:
   - `MUL_MAT` with one token and a supported weight format
-  - `RMS_NORM` and `L2_NORM` (with the next weight `MUL`), vector `ADD` and `MUL`
+  - `RMS_NORM` and `L2_NORM` (with the next weight `MUL` or `SCALE`), vector `ADD` and `MUL`
   - SwiGLU (`GLU`), SiLU, sigmoid and softplus (`UNARY`)
   - the causal convolution (`CONCAT` + `SSM_CONV`), `GATED_DELTA_NET`, `ROPE`, `CONT`
-  - the `GET_ROWS`, `CPY` and `SCALE` nodes that move the recurrent state.
+  - the `GET_ROWS`, `CPY`, `SCALE` and `FILL` nodes that move the recurrent state.
 
   The ggml scheduler gives all other nodes to the CPU backend.
 - **Command lists.** The backend makes one list from each sequence of accepted nodes. It copies inputs from host
@@ -146,12 +192,16 @@ GEMV passes at 96 % of this value. The other card time has these causes:
 - **Area.** The routed kernel uses 64 % of the LUTs and 78 % of the DSPs of the user budget. A variant with 32
   engines did not route. The LUTs limit the routing more than the DSPs.
 - **Bandwidth.** The HBM can supply 2.5 times the bandwidth that the 20 engine ports use. More engines do not fit.
+  An engine port moves 6.1 GB/s. Published measurements report 12.9 to 13.2 GB/s for one HBM channel. We did not
+  measure this value.
+- **Stream content.** Qwen3.5-4B Q4_0 has 2.57 GB of weights for each token: 71 % Q4_0, 27 % K-quants (output head
+  and `ssm_out`) and 2 % Q4_1. The card reads 2.51 GB. The four Q4_1 matrices stay on the CPU.
 - **Compute.** For Q4_0, the engines are almost at their compute limit. The peak is 20 × 128 products × 94.8 MHz
   = 243 GMAC/s. The 4B model needs 4.4 GMAC for each token. At the streaming limit, this is 88 % of the multipliers.
 
 These changes can increase the speed:
 
-- a higher clock
+- more bandwidth for each engine port (a higher engine clock or two rows for each clock)
 - less work next to the weight stream
 - one weight read for more than one token.
 

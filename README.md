@@ -58,9 +58,17 @@ Notes:
 ## Function
 
 ```
-llama.cpp  ──►  ggml backend "XRT" (llama.cpp/overlay)  ──►  gemvqc16 kernel on the U50 (fpga/src)
-                  repacks each weight tensor one time          20 engines, one HBM channel for each engine
-                  makes command lists, fuses nodes             GEMV, RMSNorm, add, SwiGLU, conv, RoPE, DeltaNet
+ Host                                                    Alveo U50
+ ┌──────────────────────────────────┐                    ┌─────────────────────────────────────────────┐
+ │ llama.cpp: ggml graph, one token │                    │ kernel gemvqc16 (fpga/src)                  │
+ │ ggml scheduler: splits           │   command list     │  command loop                               │
+ │  ├─ XRT backend (llama.cpp/      │ ─────────────────► │  quantizer ─► 20 GEMV engines ─► result     │
+ │  │  overlay): fusions, lists     │   direct start     │  writer (SwiGLU, add, convolution)          │
+ │  └─ CPU backend: attention core, │ ◄───────────────── │  4 DeltaNet units, element-wise unit        │
+ │     Q4_1 matrices, sampler       │   results for CPU  │                                             │
+ └──────────────────────────────────┘                    │ HBM2: weights 20 × 250 MiB (one channel for │
+                                                         │ each engine), activations, DeltaNet states  │
+                                                         └─────────────────────────────────────────────┘
 ```
 
 - **Command lists.** The backend puts a sequence of supported ggml nodes into one command list. It starts the
@@ -78,7 +86,7 @@ llama.cpp  ──►  ggml backend "XRT" (llama.cpp/overlay)  ──►  gemvqc1
   - the prompt and the sampler
   - tensors in formats that the card does not support.
 
-For more data, refer to [docs/DESIGN.md](docs/DESIGN.md). For the plan to increase the speed, refer to
+For the full flow diagram and more data, refer to [docs/DESIGN.md](docs/DESIGN.md). For the plan to increase the speed, refer to
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Requirements
@@ -91,7 +99,9 @@ For more data, refer to [docs/DESIGN.md](docs/DESIGN.md). For the plan to increa
 | Bitstream build | **Vitis / Vivado 2025.2** (with Vitis HLS), 48 GB RAM, 3–4 hours |
 | llama.cpp | commit **`c92e806d1c81091c9035edce99c35374da1b465e`** (11 July 2026) with the patches of this repository |
 
-The build script downloads llama.cpp at the commit above. Other llama.cpp versions need updated patches.
+The build script downloads llama.cpp at the commit above (release `b9972`). All measured values use this version.
+To build with release `b12602` (November 2026), set `LLAMA_CPP_VERSION=b12602`. We tested this version only in the
+emulator. For the status, refer to [docs/ROADMAP.md](docs/ROADMAP.md#35-newer-llamacpp).
 
 ## Quick start
 
@@ -187,13 +197,13 @@ The "Q4_0" files contain more than one format. The card calculates the Q4_0, Q8_
 | `fpga/src/` | HLS kernel `gemvqc16`, its HLS timing directives, the headers for the kernel and the host (weight layout, CPU reference) |
 | `fpga/connectivity.cfg` | HBM port assignment of the kernel for the linker |
 | `llama.cpp/overlay/` | ggml backend `ggml-xrt`, copied into the llama.cpp tree |
-| `llama.cpp/patches/` | patches to llama.cpp, applied in sequence |
+| `llama.cpp/patches/` | patches to llama.cpp, applied in sequence. `b12602/` has the patches that are different for that release |
 | `scripts/` | `build_llama.sh` and `build_xclbin.sh` (the two build steps), `benchmark.sh` |
 | `docs/` | build guide, design description, roadmap, benchmark images |
 
 ## License
 
-The code in this repository has the **Apache License 2.0** ([LICENSE](LICENSE), [NOTICE](NOTICE)). It modifies
+The code in this repository has the **Apache License 2.0** ([LICENSE](LICENSE), [NOTICE](NOTICE)). It changes
 llama.cpp (MIT). It needs XRT, Vitis and the Alveo platform of AMD under their licenses. Refer to
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
