@@ -104,6 +104,9 @@ Data of the reference build:
 - If a clock does not meet the timing, `v++` decreases it. The file `gemvqc16.xclbin.info` shows the final clocks
   (section *Scalable Clocks*: `DATA_CLK` is the kernel clock, `hbm_aclk` the HBM clock). The script also shows them.
   A new run can give different clocks. The README values come from the bitstream with 94.8 MHz and 347.9 MHz.
+- The kernel source has one change that this bitstream does not have: the new L2 norm in the DeltaNet command
+  (refer to [ROADMAP.md](ROADMAP.md#35-newer-llamacpp)). We tested this change in the C simulation and in the
+  emulator. We did not build a bitstream with it.
 - The DeltaNet units use 8 floating-point lanes (`GEMVQC_GDN_LANES` in `fpga/src/gemvqc_gdn.h`). 16 lanes give
   bit-identical results and save 2 ms for each token of the 4B model. They need 560 more DSPs (HLS estimate). We did
   not build this variant.

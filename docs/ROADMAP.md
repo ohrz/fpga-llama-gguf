@@ -173,9 +173,9 @@ release was `b12602`. The build script can use it: `LLAMA_CPP_VERSION=b12602 scr
 
 | ID | Item | Status |
 | --- | --- | --- |
-| U1 | Backend on `b12602` | completed in the emulator. All 850 checked operations agree, and the text is the same as on the CPU |
+| U1 | Backend on `b12602` | completed in the emulator. All checked operations agree, and the text is the same as on the CPU |
 | U2 | Fusions on the new graph | completed in the emulator. The same run has 174 graph calls with the two versions |
-| U5 | New L2 norm formula in the DeltaNet command | open. It needs a new bitstream. Estimated gain: 0.3 ms for each token |
+| U5 | New L2 norm formula in the DeltaNet command | completed in the kernel source and in the emulator. The card needs a new bitstream. Estimated gain: 0.3 ms for each token |
 | U3 | Fused Qwen3.5 weights (`wqkv_z`, `ssm_beta_alpha_cat`) | open. Fewer and larger GEMV groups |
 | U4 | Measurement on the card | open. Compare the two versions with the same bitstream |
 
@@ -193,18 +193,32 @@ The backend now sends the `RMS_NORM` and its `SCALE` to the card as one `RMSNORM
 All other fusions are the same as with `b9972`: the convolution epilog, the gates, the gated norm and `ssm_out`
 in the DeltaNet pass.
 
-**The L2 norm stays a separate command (U5).** The two versions use different formulas:
+**The L2 norm (U5).** The two versions use different formulas:
 
-| Version | Formula | In the kernel |
-| --- | --- | --- |
-| `b9972` | `x / max(sqrt(sum), eps)` | part of the DeltaNet command |
-| `b12602` | `x / sqrt(sum + eps)` | `RMSNORM` command with a constant weight |
+| Version | Formula | Current bitstream | Kernel source |
+| --- | --- | --- | --- |
+| `b9972` | `x / max(sqrt(sum), eps)` | part of the DeltaNet command | part of the DeltaNet command |
+| `b12602` | `x / sqrt(sum + eps)` | `RMSNORM` command with a constant weight | part of the DeltaNet command (flag `GEMVQC_GDN_L2_SUM`) |
 
 We tested the old formula in the DeltaNet command with the new graph. The emulator check failed in layer 1. The
-smallest sum of squares of a head was 0.006, and the relative difference was 8e-5. Thus the backend uses the exact
-form. Each DeltaNet layer has two more `RMSNORM` commands (2048 values each). The estimated cost is 0.3 ms for
-each token. This estimate uses the measured mean time of the norm commands (approximately 6 µs). A kernel with the
-new formula in the DeltaNet command removes this cost.
+smallest sum of squares of a head was 0.006, and the relative difference was 8e-5. Thus, with the current
+bitstream, the backend uses the exact form. Each DeltaNet layer has two more `RMSNORM` commands (2048 values
+each). The estimated cost is 0.3 ms for each token. This estimate uses the measured mean time of the norm commands
+(approximately 6 µs).
+
+The kernel source now has the new formula in the DeltaNet command. The two formulas use the same square root and
+the same divider. A feature bit shows the backend that the kernel has the new flag. If the bit is not set, the
+backend uses the `RMSNORM` commands. Thus the backend operates with the two bitstreams. The results:
+
+- C simulation of the kernel: 193 of 193 cases agree. The new command gives the same bits as a DeltaNet step with
+  q and k that the host normalized.
+- Emulator with `b12602`: 754 checked operations agree. The 96 `RMSNORM` commands of the run are not necessary.
+  The check compares the DeltaNet command with the `RMSNORM` commands that it replaces.
+- Emulator with `b12602` and without the feature bit: 850 checked operations agree, as before.
+- Emulator with `b9972`: 742 checked operations agree, as before.
+- HLS estimate: +125 LUT and +400 FF, no more DSPs, the same clock estimate.
+
+We did not build a bitstream with this kernel source. The measured bitstream does not have the new flag.
 
 In `b12602`, the graph selects the output token before the last residual addition. In `b9972`, it selects the
 output token after the last norm. Thus, with `b12602`, the card also calculates the end of the last layer of a
@@ -234,7 +248,7 @@ prompt. This is the reason for the different number of checked operations in the
 | Step | Content | Token time 4B Q4_0 | Tokens/s 4B Q4_0 |
 | --- | --- | --- | --- |
 | current | 20 engines, 94.8 MHz (measured) | 32.6 ms | 30.7 |
-| 1 | U4: measure llama.cpp `b12602` on the card (U2 is complete) | open (estimate: +0.3 ms until U5) | open |
+| 1 | U4: measure llama.cpp `b12602` on the card (U2 is complete) | open (estimate: +0.3 ms with the current bitstream) | open |
 | 2 | C1: measure the port bandwidth | as current | as current |
 | 3 | C5: area reduction, target ≤ 3300 DSPs | as current | as current |
 | 4 | A7 two-phase DeltaNet step, B3 Q4_1 on the card | ≈ 29.6 ms | ≈ 34 |

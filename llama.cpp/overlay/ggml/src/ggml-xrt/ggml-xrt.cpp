@@ -196,11 +196,12 @@ struct xrt_qc_plan {
     };
     struct gdn_norms {
         bool l2 = false; float l2_eps = 0.0f; ggml_tensor * out = nullptr; const ggml_tensor * w = nullptr;
+        bool l2_sum = false;  // q and k are SCALE(RMS_NORM(x, l2_eps), 1 / sqrt(128)), not L2_NORM(x, l2_eps)
         const ggml_tensor * z = nullptr; float rms_eps = 0.0f;
         // gates: beta = sigmoid(beta_raw), g = softplus(alpha_raw + dt) * a
         const ggml_tensor * alpha_raw = nullptr, * beta_raw = nullptr, * dt = nullptr, * a = nullptr;
         bool operator==(const gdn_norms & o) const {
-            return l2 == o.l2 && l2_eps == o.l2_eps && out == o.out && w == o.w && z == o.z && rms_eps == o.rms_eps &&
+            return l2 == o.l2 && l2_sum == o.l2_sum && l2_eps == o.l2_eps && out == o.out && w == o.w && z == o.z && rms_eps == o.rms_eps &&
                    alpha_raw == o.alpha_raw && beta_raw == o.beta_raw && dt == o.dt && a == o.a;
         }
     };
@@ -361,6 +362,7 @@ static constexpr uint32_t XRT_QC_FEATURE_GDN_OUT = 32768U;
 // Second feature word (GEMVQC_FEATURES2: marker 0x6B52 in the high half), kept in the high half of qc_features.
 static constexpr uint32_t XRT_QC_FEATURE2_MARK = 0x6B520000U;
 static constexpr uint32_t XRT_QC_FEATURE_SIGMOID_MUL = 1U << 16;  // SILU_MUL flag 1: sigmoid(g) * u, strided g
+static constexpr uint32_t XRT_QC_FEATURE_GDN_L2_SUM = 1U << 17;   // GDN with the L2 norm x / sqrt(sum + eps)
 
 static uint32_t xrt_active_qc_features() {
     std::lock_guard<std::mutex> lock(xrt_device_context_inst.mutex);
@@ -808,7 +810,7 @@ static constexpr unsigned XRT_QC_OP_MUL = 5, XRT_QC_OP_UNARY = 6, XRT_QC_OP_GDN 
 static constexpr unsigned XRT_QC_OP_STATE_LOAD = 9, XRT_QC_GEMV_SWIGLU = 0x100, XRT_QC_GDN_WITH_GEMV = 1;
 static constexpr unsigned XRT_QC_OP_TRACE = 11;
 static constexpr unsigned XRT_QC_GEMV_CONV = 0x200, XRT_QC_GEMV_ADD = 0x400, XRT_QC_GDN_L2_QK = 2, XRT_QC_GDN_GATED = 4;
-static constexpr unsigned XRT_QC_GDN_GATES = 8, XRT_QC_GDN_WITH_OUT = 16;
+static constexpr unsigned XRT_QC_GDN_GATES = 8, XRT_QC_GDN_WITH_OUT = 16, XRT_QC_GDN_L2_SUM = 32;
 static constexpr unsigned XRT_QC_OUT_BLOCK = 256, XRT_QC_OUT_MAX_ROWS = 512;  // column block, rows per engine
 
 // Channel-pair arenas hold every model with its output head. Single-channel arenas (20 engines) take the head only
@@ -1966,6 +1968,19 @@ static bool xrt_qc_build_plan(const xrt_backend_context * ctx, struct ggml_cgrap
                 nm.l2 = true;
                 nm.l2_eps = ggml_get_op_params_f32(q, 0);
             }
+            // llama.cpp b12602 writes that norm as SCALE(RMS_NORM(x, eps / n), 1 / sqrt(n)) = x / sqrt(sum + eps).
+            const auto l2_sum = [&](const ggml_tensor * t) {
+                const ggml_tensor * rn = t->src[0];
+                return t->op == GGML_OP_SCALE && rn->op == GGML_OP_RMS_NORM && single(t) == node && single(rn) == t &&
+                       rn->ne[0] == XRT_QC_GDN_HEAD && ggml_is_contiguous(rn->src[0]) &&
+                       ggml_get_op_params_f32(t, 0) == 1.0f / sqrtf(float(XRT_QC_GDN_HEAD)) && ggml_get_op_params_f32(t, 1) == 0.0f;
+            };
+            if (norms_on && (ctx->qc_features & XRT_QC_FEATURE_GDN_L2_SUM) && l2_sum(q) && l2_sum(k) &&
+                ggml_get_op_params_f32(q->src[0], 0) == ggml_get_op_params_f32(k->src[0], 0)) {
+                nm.l2 = nm.l2_sum = true;
+                nm.l2_eps = ggml_get_op_params_f32(q->src[0], 0);
+                skip.insert({q->src[0], k->src[0]});
+            }
             // y (the first hv * 128 floats of the node) -> RMS_NORM rows of 128 -> MUL weight -> MUL SILU(z); the node
             // is read by that RMS_NORM and the CPY of the new state only.
             ggml_tensor * r = nullptr;
@@ -2659,6 +2674,12 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                 const auto ni = norms_of.find(node);
                 const gdn_norms nm = ni != norms_of.end() ? ni->second : gdn_norms();
                 const ggml_tensor * qi = nm.l2 ? q->src[0] : q, * ki = nm.l2 ? k->src[0] : k;  // raw q/k with fused L2
+                if (nm.l2_sum) {
+                    qi = qi->src[0];
+                    ki = ki->src[0];
+                }
+                // x / sqrt(sum / 128 + e) / sqrt(128) = x / sqrt(sum + 128 * e)
+                const float l2_eps = nm.l2_sum ? nm.l2_eps * float(S) : nm.l2_eps;
                 const bool gates = nm.alpha_raw != nullptr;
                 const ggml_tensor * gi = gates ? nm.alpha_raw : g, * bi = gates ? nm.beta_raw : be;
                 std::vector<xrt_qc_operand> ops = {{qi, qi->data, hk * S}, {ki, ki->data, hk * S}, {v, v->data, hv * S},
@@ -2675,7 +2696,7 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                 // With the gated norm the command writes only its result (the node behind the norm).
                 const unsigned y_off = xrt_qc_output(list, nm.out != nullptr ? nm.out : node, hv * S);
                 const unsigned norm_flags = (nm.l2 ? XRT_QC_GDN_L2_QK : 0U) | (nm.out != nullptr ? XRT_QC_GDN_GATED : 0U) |
-                                            (gates ? XRT_QC_GDN_GATES : 0U);
+                                            (gates ? XRT_QC_GDN_GATES : 0U) | (nm.l2_sum ? XRT_QC_GDN_L2_SUM : 0U);
                 const unsigned dt_off = gates ? offs[ops.size() - 2] : 0U, a_off = gates ? offs[ops.size() - 1] : 0U;
                 const unsigned w_off = nm.out != nullptr ? offs[5] : 0U, z_off = nm.out != nullptr ? offs[6] : 0U;
                 // The step's GEMV, if it is still in this list: its command moves behind the step (nothing in between
@@ -2699,7 +2720,7 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                 }
                 xrt_qc_push(list, {XRT_QC_OP_GDN, hv | (hk << 16), offs[0], offs[1], offs[2], offs[3], offs[4], y_off});
                 xrt_qc_push(list, {src_row, dst_row, xrt_qc_float_bits(scale),
-                                   (late_cmd.empty() ? 0U : XRT_QC_GDN_WITH_GEMV) | norm_flags, xrt_qc_float_bits(nm.l2_eps),
+                                   (late_cmd.empty() ? 0U : XRT_QC_GDN_WITH_GEMV) | norm_flags, xrt_qc_float_bits(l2_eps),
                                    xrt_qc_float_bits(nm.rms_eps), w_off, z_off});
                 if (gates) xrt_qc_push(list, {dt_off, a_off});
                 list.gdn_flags_at = late_cmd.empty() ? list.cmds.size() - (gates ? 2U : 1U) * XRT_QC_CMD_WORDS + 3U : SIZE_MAX;
@@ -2714,7 +2735,11 @@ static enum ggml_status xrt_qc_graph_compute_gdn(xrt_backend_context * ctx, stru
                         const float * act = c->qc_act_bo.map<const float *>();
                         std::vector<double> y_mag, s_mag;
                         std::vector<float> qn(act + offs[0], act + offs[0] + hk * S), kn(act + offs[1], act + offs[1] + hk * S);
-                        if (nm.l2) {
+                        if (nm.l2_sum) {  // the reference: the RMSNORM commands with the constant weight
+                            const std::vector<float> cs(S, 1.0f / sqrtf(float(S)));
+                            qn = gemvq_ref::rownorm(qn.data(), cs.data(), unsigned(S), hk, nm.l2_eps, 0);
+                            kn = gemvq_ref::rownorm(kn.data(), cs.data(), unsigned(S), hk, nm.l2_eps, 0);
+                        } else if (nm.l2) {
                             qn = gemvq_ref::rownorm(qn.data(), nullptr, unsigned(S), hk, nm.l2_eps, XRT_QC_NORM_L2 | XRT_QC_NORM_NO_WEIGHT);
                             kn = gemvq_ref::rownorm(kn.data(), nullptr, unsigned(S), hk, nm.l2_eps, XRT_QC_NORM_L2 | XRT_QC_NORM_NO_WEIGHT);
                         }

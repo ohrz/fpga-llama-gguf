@@ -194,9 +194,9 @@ void stage_b(vword * st_wr, vword * st, gdn_pass pass, const vword * kbuf, const
 static_assert(U == 4, "the GEMV pass of gemvqc16 is written out for four state ports");
 
 // Per-head scales of `heads` rows of 128 floats in buf (8 words each), exactly as the RMSNORM opcode (rownorm) does
-// it: sumsq16 per word, row_scale over the 8 word sums (newest first). l2: 1 / max(sqrt(sum), eps), else
-// 1 / sqrt(mean + eps).
-void head_scales(const vword * buf, unsigned heads, float eps, bool l2, float * scale) {
+// it: sumsq16 per word, row_scale over the 8 word sums (newest first). l2: 1 / max(sqrt(sum), eps), with l2_sum
+// 1 / sqrt(sum + eps), else 1 / sqrt(mean + eps).
+void head_scales(const vword * buf, unsigned heads, float eps, bool l2, bool l2_sum, float * scale) {
     float part[SW];
 #pragma HLS ARRAY_PARTITION variable=part complete
     GDN_HEAD_SUM: for (unsigned i = 0; i < heads * SW; ++i) {
@@ -204,7 +204,7 @@ void head_scales(const vword * buf, unsigned heads, float eps, bool l2, float * 
         part[i % SW] = gemvqc_ops::sumsq16(buf[i]);
         if (i % SW == SW - 1U) {
             scale[i / SW] = gemvqc_ops::row_scale(part[7], part[6], part[5], part[4], part[3], part[2], part[1], part[0],
-                                                  S, eps, l2);
+                                                  S, eps, l2, l2_sum);
         }
     }
 }
@@ -222,11 +222,12 @@ vword scale_word(const vword & w, float s, bool on) {
 
 // Step inputs into the units' local copies (before the pass). q_off, k_off: H_k * 128 floats; v_off: H_v * 128
 // floats; g_off, beta_off: H_v floats. l2: q and k are L2-normalized per head on the way (ggml_l2_norm with
-// l2_eps, the arithmetic of the RMSNORM opcode with flags 3). gates: g and beta are the raw projections; per head
+// l2_eps, the arithmetic of the RMSNORM opcode with flags 3; with l2_sum x / sqrt(sum + l2_eps)). gates: g and beta are the raw projections; per head
 // beta = sigmoid(beta) and g = softplus(g + dt) * a (dt, a: H_v floats), the arithmetic of the UNARY, ADD and MUL
 // opcodes.
 void gdn_load(const vword * act, unsigned hv, unsigned hk, unsigned q_off, unsigned k_off, unsigned v_off,
-              unsigned g_off, unsigned beta_off, bool l2, float l2_eps, bool gates, unsigned dt_off, unsigned a_off,
+              unsigned g_off, unsigned beta_off, bool l2, bool l2_sum, float l2_eps, bool gates, unsigned dt_off,
+              unsigned a_off,
               vword ka[U][MAX_HEADS * SW],
               vword kb[U][MAX_HEADS * SW], vword qb[U][MAX_HEADS * SW], vword v[U][MAX_HEADS * SW],
               float decay[U][MAX_HEADS], float beta[U][MAX_HEADS], vword * buf_a) {
@@ -235,7 +236,7 @@ void gdn_load(const vword * act, unsigned hv, unsigned hk, unsigned q_off, unsig
     float hs[2 * MAX_HEADS];
     gemvqc_ops::load_words(act + q_off / 16U, kwords, buf_a + QK);
     gemvqc_ops::load_words(act + k_off / 16U, kwords, buf_a + QK + kwords);
-    if (l2) head_scales(buf_a + QK, 2U * hk, l2_eps, true, hs);
+    if (l2) head_scales(buf_a + QK, 2U * hk, l2_eps, true, l2_sum, hs);
     GDN_LOAD_QK: for (unsigned i = 0; i < kwords; ++i) {
 #pragma HLS PIPELINE II=1
         const vword q = scale_word(buf_a[QK + i], hs[i / SW], l2);

@@ -72,6 +72,8 @@
 //             flags bit 3 (GEMVQC_GDN_GATES): a third slot [dt_off, a_off, 0, ...] follows; g_off and beta_off hold
 //             the raw projections, and per head beta = sigmoid(beta), g = softplus(g + dt) * a (dt, a: H_v floats),
 //             the UNARY, ADD and MUL opcodes' arithmetic. The GEMV of GEMVQC_GDN_WITH_GEMV then follows that slot.
+//             flags bit 5 (GEMVQC_GDN_L2_SUM, only with bit 1): the L2 norm of q and k is x / sqrt(sum + l2_eps)
+//             (llama.cpp b12602) instead of x / max(sqrt(sum), l2_eps).
 //             flags bit 4 (GEMVQC_GDN_WITH_OUT, not with bit 0): the next command is a GEMV on the step's output
 //             (x_off = y_off, cols = H_v * 128, a multiple of 256, rows <= 512 per engine, no SwiGLU or CONV bit),
 //             optionally with GEMVQC_GEMV_ADD and its ADD (whose residual must not overlap the step's output). It runs
@@ -117,6 +119,7 @@
 #define GEMVQC_GDN_GATED 4U
 #define GEMVQC_GDN_GATES 8U
 #define GEMVQC_GDN_WITH_OUT 16U
+#define GEMVQC_GDN_L2_SUM 32U
 #define GEMVQC_GEMV_CONV 0x200U
 #define GEMVQC_GEMV_ADD 0x400U
 // Returns 0 when all commands ran, else the 1-based index of the first invalid command (nothing after it runs).
@@ -130,8 +133,8 @@
 // bit 13 packed Q6_K layout (three super-block metas per word, see gemvqw_layout.h) | bit 14 TRACE |
 // bit 15 GDN_WITH_OUT and the gated norm in the step's pass (z read when the step starts)
 #define GEMVQC_FEATURES (0x6B51FFF9U | (GEMVQ_HAS_Q6_K ? 2U : 0U) | (GEMVQ_HAS_Q4_1 ? 4U : 0U))
-// 0x6B52 marker | bit 0 SILU_MUL with the sigmoid flag and strided g
-#define GEMVQC_FEATURES2 0x6B520001U
+// 0x6B52 marker | bit 0 SILU_MUL with the sigmoid flag and strided g | bit 1 GDN_L2_SUM
+#define GEMVQC_FEATURES2 0x6B520003U
 #define GEMVQC_SILU_MUL_SIGMOID 1U
 extern "C" int gemvqc16(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<512> * w2,
                         const ap_uint<512> * w3, const ap_uint<512> * w4, const ap_uint<512> * w5,

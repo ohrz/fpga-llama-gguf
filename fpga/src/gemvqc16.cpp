@@ -818,7 +818,8 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
                     (cmd[2] % 16U) != 0 || (cmd[3] % 16U) != 0 || (cmd[4] % 16U) != 0 || (cmd[5] % 16U) != 0 ||
                     (cmd[6] % 16U) != 0 || (cmd[7] % 16U) != 0 || (ext[0] % U) != 0 || (ext[1] % U) != 0 ||
                     ext[3] > (GEMVQC_GDN_WITH_GEMV | GEMVQC_GDN_L2_QK | GEMVQC_GDN_GATED | GEMVQC_GDN_GATES |
-                              GEMVQC_GDN_WITH_OUT) ||
+                              GEMVQC_GDN_WITH_OUT | GEMVQC_GDN_L2_SUM) ||
+                    ((ext[3] & GEMVQC_GDN_L2_SUM) != 0 && (ext[3] & GEMVQC_GDN_L2_QK) == 0) ||
                     ((ext[3] & GEMVQC_GDN_GATED) != 0 && ((ext[6] % 16U) != 0 || (ext[7] % 16U) != 0)) ||
                     (gates && ((ext2[0] % 16U) != 0 || (ext2[1] % 16U) != 0))) {
                     status = int(c + 1);
@@ -842,8 +843,8 @@ void run_list(const ap_uint<512> * w0, const ap_uint<512> * w1, const ap_uint<51
                     step_y = cmd[7];
                     step_dst = ext[1];
                     gdn_load(act, hv, hk, cmd[2], cmd[3], cmd[4], cmd[5], cmd[6], (ext[3] & GEMVQC_GDN_L2_QK) != 0,
-                             gemvqw_engine::bits_to_float(ext[4]), gates, ext2[0], ext2[1], gdn_ka, gdn_kb, gdn_qb,
-                             gdn_v, gdn_decay, gdn_beta, buf_a);
+                             (ext[3] & GEMVQC_GDN_L2_SUM) != 0, gemvqw_engine::bits_to_float(ext[4]), gates, ext2[0],
+                             ext2[1], gdn_ka, gdn_kb, gdn_qb, gdn_v, gdn_decay, gdn_beta, buf_a);
                     // The gated norm runs in the pass: z and its weight come on chip with the other inputs.
                     if (pass.gated) {
                         gemvqc_ops::load_words(act + ext[7] / 16U, hv * SW, buf_b);

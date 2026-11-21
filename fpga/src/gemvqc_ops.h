@@ -117,12 +117,16 @@ float add_f(float a, float b) {
     return a + b;
 }
 
+// The scale of a row from its eight word sums: 1 / sqrt(sum / n + eps), with l2 1 / max(sqrt(sum), eps)
+// (ggml_l2_norm), with l2 and l2_sum 1 / sqrt(sum + eps). One square root and one division for the three forms.
 float row_scale(float p0, float p1, float p2, float p3, float p4, float p5, float p6, float p7, unsigned n, float eps,
-                bool l2) {
+                bool l2, bool l2_sum = false) {
 #pragma HLS INLINE off
     const float part[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
     const float sum = ((part[0] + part[1]) + (part[2] + part[3])) + ((part[4] + part[5]) + (part[6] + part[7]));
-    return l2 ? 1.0f / (hls::sqrtf(sum) > eps ? hls::sqrtf(sum) : eps) : 1.0f / hls::sqrtf(sum / float(n) + eps);
+    const bool l2_max = l2 && !l2_sum;
+    const float root = hls::sqrtf(l2_max ? sum : (l2 ? sum : sum / float(n)) + eps);
+    return 1.0f / (l2_max && !(root > eps) ? eps : root);
 }
 
 float norm_apply_f(float x, float g, float s, bool weighted) {
