@@ -13,10 +13,10 @@ You need the two items to run on the card.
 | --- | --- | --- |
 | Alveo U50 card | `xcu50-fsvh2104-2-e`, 8 GB HBM2 | one card. The backend opens device 0 if `GGML_XRT_DEVICE` is not set |
 | Platform | `xilinx_u50_gen3x16_xdma_5_202210_1` | deployment platform on the card, development platform in `/opt/xilinx/platforms` (for `v++`) |
-| XRT | 2.26.0, upstream commit `11169ba504943e72482836feb6bd13af37350bdf` | headers and `libxrt_coreutil` for the build, `xocl` driver at run time |
+| XRT | 2.26.0, upstream tag `202620.2.26.149` (commit `ca87dd5c`). Before 2026-11-21: commit `11169ba5` | headers and `libxrt_coreutil` for the build, `xocl` driver at run time. The two versions gave the same texts and the same speed (2026-11-21). After an XRT update, build the host programs again |
 | Vitis / Vivado / Vitis HLS | **2025.2** | only for the bitstream and the emulator |
 | OS / compiler | Ubuntu 24.04, GCC 13.3, CMake 3.28, Ninja 1.11, git | other Linux toolchains are not tested |
-| llama.cpp | `c92e806d1c81091c9035edce99c35374da1b465e` (release `b9972`) | `scripts/build_llama.sh` downloads this commit. `LLAMA_CPP_VERSION=b12602` selects commit `418fe97b5f01b11eeb89f30d8a0459433edbf1d2`, tested only in the emulator |
+| llama.cpp | `c92e806d1c81091c9035edce99c35374da1b465e` (release `b9972`) | `scripts/build_llama.sh` downloads this commit. `LLAMA_CPP_VERSION=b12602` selects commit `418fe97b5f01b11eeb89f30d8a0459433edbf1d2`, tested in the emulator and on the card |
 
 1. Install the U50 platform and XRT. Use the Alveo U50 documentation of AMD.
 2. Make sure that XRT finds the card. `xbutil examine` must show the U50.
@@ -104,9 +104,12 @@ Data of the reference build:
 - If a clock does not meet the timing, `v++` decreases it. The file `gemvqc16.xclbin.info` shows the final clocks
   (section *Scalable Clocks*: `DATA_CLK` is the kernel clock, `hbm_aclk` the HBM clock). The script also shows them.
   A new run can give different clocks. The README values come from the bitstream with 94.8 MHz and 347.9 MHz.
-- The kernel source has one change that this bitstream does not have: the new L2 norm in the DeltaNet command
-  (refer to [ROADMAP.md](ROADMAP.md#35-newer-llamacpp)). We tested this change in the C simulation and in the
-  emulator. We did not build a bitstream with it.
+- The kernel source has two changes that this bitstream does not have:
+  - the new L2 norm in the DeltaNet command (refer to [ROADMAP.md](ROADMAP.md#35-newer-llamacpp))
+  - the area reduction C5: 3267 DSPs instead of 4025, 72,000 more LUTs (HLS estimate). The results have the same
+    bits.
+
+  We tested these changes in the C simulation and in the emulator. We did not build a bitstream with them.
 - The DeltaNet units use 8 floating-point lanes (`GEMVQC_GDN_LANES` in `fpga/src/gemvqc_gdn.h`). 16 lanes give
   bit-identical results and save 2 ms for each token of the 4B model. They need 560 more DSPs (HLS estimate). We did
   not build this variant.

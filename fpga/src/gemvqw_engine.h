@@ -95,8 +95,9 @@ float word_lane_float(const ap_uint<512> & word, unsigned lane) {
 // Q8_0-quantize x like llama.cpp's quantize_row_q8_0: scale = amax / 127 stored as FP16, roundf(x / scale).
 // x is read as 512-bit words (16 FP32 lanes, lane 0 in bits 31:0), two words per block.
 // Writes N identical copies so N engines read in parallel. blocks must be a multiple of 4.
-// The xs lane of a block holds the FP16-rounded scale as FP32; with q8_1 (Q8_1 for Q4_1, quantize_row_q8_1_ref)
-// it holds the FP16 scale in bits 15:0 and FP16(sum of the quants * scale) in bits 31:16.
+// The xs lane of a block holds the FP16 scale in bits 15:0 and the sum of the block's 32 quants in bits 31:16 (the
+// engine needs it for Q4_0, see compute_words); with q8_1 (Q8_1 for Q4_1, quantize_row_q8_1_ref) bits 31:16 hold
+// FP16(sum of the quants * scale).
 // CHAIN == false writes N copies into local_xq / local_xs, CHAIN == true sends every finished word into `link`
 // instead (see quantize_any_stream). SRC_STREAM: the words of x come from `xin` (in order) instead of `x`.
 template <int N, bool CHAIN, bool SRC_STREAM = false>
@@ -138,8 +139,8 @@ void quantize_x_impl(const ap_uint<512> * x, unsigned blocks, xq_word (*local_xq
             quant_sum += rounded;
         }
         const ap_uint<16> scale_half = fp32_to_fp16(scale);
-        const uint32_t lane = q8_1 ? uint32_t(scale_half) | (uint32_t(fp32_to_fp16(float(quant_sum) * scale)) << 16)
-                                   : float_to_bits(half_bits_to_float(scale_half));
+        const uint32_t lane = uint32_t(scale_half) |
+                              (uint32_t(q8_1 ? fp32_to_fp16(float(quant_sum) * scale) : ap_uint<16>(quant_sum)) << 16);
         // Shift registers: after four blocks block 0 sits at the lowest position.
         pending_q = (pending_q >> 256) | (xq_word(packed) << 768);
         pending_s = (pending_s >> 32) | (xs_word(lane) << 96);
@@ -168,7 +169,8 @@ void quantize_x(const ap_uint<512> * x, unsigned blocks, xq_word (*local_xq)[XWO
 // the largest magnitude (the first one on ties) gives iscale = -127 / max, q = min(127, nearest_int(iscale * x)),
 // round half to even through the FP32 addition of 1.5 * 2^23, and d = 1 / iscale (all zero for a zero block).
 // local_xq as for Q8_0 (128 activations per word, element e of the word at bits 8e..8e+7); local_xs per word:
-// bits 31:0 the super-block's d (FP32), bits 32+16k..47+16k the sum of the 32 quants of block k of the word.
+// bits 31:0 the super-block's d (FP32), bits 32+12h..43+12h the sum of the 16 quants 16h..16h+15 of the word
+// (the stored int8 values, as in ggml).
 template <int N, bool CHAIN, bool SRC_STREAM = false>
 void quantize_x_k_impl(const ap_uint<512> * x, unsigned superblocks, xq_word (*local_xq)[XWORDS],
                        xs_word (*local_xs)[XWORDS], hls::stream<xmsg> & link, hls::stream<ap_uint<512>> * xin = nullptr) {
@@ -208,8 +210,7 @@ void quantize_x_k_impl(const ap_uint<512> * x, unsigned superblocks, xq_word (*l
         const float iscale = amax == 0 ? 0.0f : -127.0f / vmax;
         const float d = amax == 0 ? 0.0f : 1.0f / iscale;
         xq_word pending_q = 0;
-        int block_sum[8];
-#pragma HLS ARRAY_PARTITION variable=block_sum complete
+        ap_uint<96> pending_sum = 0;
         QXK_QUANT: for (unsigned w = 0; w < 16; ++w) {
 #pragma HLS PIPELINE II=1
             const ap_uint<512> word = raw[w];
@@ -221,18 +222,15 @@ void quantize_x_k_impl(const ap_uint<512> * x, unsigned superblocks, xq_word (*l
                 const int v = int(float_to_bits(biased) & 0x7fffffU) - 0x400000;
                 const int q = v > 127 ? 127 : v;
                 packed.range(l * 8 + 7, l * 8) = ap_uint<8>(q);
-                part += q;
+                part += int(ap_int<8>(q));
             }
-            block_sum[w / 2U] = (w & 1U) ? block_sum[w / 2U] + part : part;
-            // Shift register: after eight words the super-block half's first value sits at the lowest position.
+            // Shift registers: after eight words the super-block half's first value sits at the lowest position.
             pending_q = (pending_q >> 128) | (xq_word(packed) << 896);
+            pending_sum = (pending_sum >> 12) | (ap_uint<96>(ap_uint<12>(part)) << 84);
             if ((w & 7U) == 7U) {
                 const unsigned half = w / 8U;
                 xs_word xs = xs_word(float_to_bits(d));
-                for (unsigned k = 0; k < 4; ++k) {
-#pragma HLS UNROLL
-                    xs.range(47 + 16 * k, 32 + 16 * k) = ap_uint<16>(block_sum[4U * half + k]);
-                }
+                xs.range(127, 32) = pending_sum;
                 if (CHAIN) {
                     link.write(xmsg{pending_q, xs});
                 } else {
@@ -393,15 +391,6 @@ scale_parts float_scale_parts(ap_uint<32> bits) {
     return r;
 }
 
-// Same for an FP32 that holds an FP16 value (the activation scales of Q8_0): 11 significant bits are enough.
-scale_parts halfvalue_scale_parts(ap_uint<32> bits) {
-#pragma HLS INLINE
-    scale_parts r = float_scale_parts(bits);
-    r.m = r.m >> 13;
-    r.e += 13;
-    return r;
-}
-
 // p * 2^exp2 as a fixed-point accumulator value. exp2 is clamped to [LO, LO + RANGE]; the shift is one left shift
 // by exp2 - LO followed by a constant right shift, so a single barrel shifter covers negative and positive exponents.
 template <int PW, int LO, int RANGE>
@@ -414,16 +403,31 @@ acc_t shifted_fixed(ap_int<PW> p, int exp2) {
     return acc_t(v >> (-(ACC_FRAC_BITS + LO)));
 }
 
-// Lane of Q4_0 / Q8_0: dot * weight_scale * activation_scale.
-// x_half (Q4_1 with Q8_1 activations): the activation scale is the FP16 in bits 15:0 of the lane.
-acc_t scale_lane_fixed(int dot, ap_uint<16> weight_scale_bits, ap_uint<32> x_scale_bits, bool active, bool x_half) {
+// The two scale multipliers of a lane. Q4_0 / Q8_0 / Q4_1: dot * weight_scale * activation_scale (both FP16), as
+// the product of the significands and its product with the block sum; term is the lane's value. K-quants: the same
+// multipliers give the lane's two scale products, sc_a * half0 + sc_b * half1 (s_sum). The format groups are never
+// active together.
+struct lane_scaled {
+    acc_t term;
+    int s_sum;
+};
+lane_scaled scale_lane_fixed(bool kq, int dot, ap_uint<16> weight_scale_bits, ap_uint<16> x_scale_bits, bool active,
+                             ap_int<8> sc_a, ap_int<8> sc_b, ap_int<20> half0, ap_int<20> half1) {
 #pragma HLS INLINE
     const scale_parts w = half_scale_parts(weight_scale_bits);
-    const scale_parts x = x_half ? half_scale_parts(x_scale_bits.range(15, 0)) : halfvalue_scale_parts(x_scale_bits);
-    const ap_uint<22> mp = ap_uint<11>(w.m) * ap_uint<11>(x.m);
+    const scale_parts x = half_scale_parts(x_scale_bits);
+    const ap_int<12> a1 = kq ? ap_int<12>(sc_a) : ap_int<12>(ap_uint<11>(w.m));
+    const ap_int<20> b1 = kq ? half0 : ap_int<20>(ap_uint<11>(x.m));
+    const ap_int<32> first = a1 * b1;  // significand product (22 bits), or sc_a * half0
+#pragma HLS BIND_OP variable=first op=mul impl=dsp
     const ap_int<22> d = active ? ap_int<22>(w.neg ? -dot : dot) : ap_int<22>(0);
-    const ap_int<45> p = stage_reg(ap_int<45>(d * ap_int<23>(mp)));
-    return stage_reg(shifted_fixed<45, -58, 70>(p, w.e + x.e));
+    const ap_int<22> a2 = kq ? ap_int<22>(sc_b) : d;
+    const ap_int<23> b2 = kq ? ap_int<23>(half1) : ap_int<23>(ap_uint<22>(first));
+    const ap_int<45> p = stage_reg(ap_int<45>(a2 * b2));
+    lane_scaled r;
+    r.term = stage_reg(shifted_fixed<45, -58, 70>(p, w.e + x.e));
+    r.s_sum = int(first) + int(ap_int<28>(p));
+    return r;
 }
 
 // K-quant word: s_sum * d - m_sum * dmin with d = d_half * dx, dmin = dmin_half * dx (dx the FP32 scale of the Q8_K block).
@@ -435,9 +439,11 @@ acc_t scale_k_fixed(int s_sum, int m_sum, ap_uint<16> d_bits, ap_uint<16> dmin_b
     const ap_uint<35> md = stage_reg(ap_uint<35>(ap_uint<11>(dh.m) * ap_uint<24>(dx.m)));
     const ap_uint<35> mm = stage_reg(ap_uint<35>(ap_uint<11>(mh.m) * ap_uint<24>(dx.m)));
     const bool neg_s = dh.neg != dx.neg, neg_m = mh.neg != dx.neg;
-    const ap_int<33> s_val(s_sum), m_val(m_sum);
-    const ap_int<33> si = neg_s ? ap_int<33>(-s_val) : s_val;
-    const ap_int<33> mi = neg_m ? ap_int<33>(-m_val) : m_val;
+    // Widths: |S| <= 16 * 128 * (16 * 128 * 32) = 2^27 (Q6_K), |M| <= 8 * 63 * (32 * 128) < 2^21 (Q5_K).
+    const ap_int<29> s_val(s_sum);
+    const ap_int<23> m_val(m_sum);
+    const ap_int<29> si = neg_s ? ap_int<29>(-s_val) : s_val;
+    const ap_int<23> mi = neg_m ? ap_int<23>(-m_val) : m_val;
     const ap_int<69> ps = stage_reg(ap_int<69>(si * ap_int<36>(md)));
     const ap_int<69> pm = stage_reg(ap_int<69>(mi * ap_int<36>(mm)));
     return stage_reg(shifted_fixed<69, -81, 78>(ps, dh.e + dx.e)) - stage_reg(shifted_fixed<69, -81, 78>(pm, mh.e + dx.e));
@@ -452,6 +458,19 @@ acc_t scale_k_fixed(int s_sum, int m_sum, ap_uint<16> d_bits, ap_uint<16> dmin_b
 // Q4_0 nibble order. Q5_K: weight = nibble + 16 * high bit, scale and min per 32 weights. Q6_K: weight =
 // (nibble | 2 high bits << 4) - 32, int8 scale per 16 weights. The super-block's integer sums S = sum sc * (q . q8)
 // and M = sum m * (sum q8) give one FP32 term d * dx * S - dmin * dx * M after its second quant word.
+//
+// Products: 64 multipliers of 18 x 18 bits (one DSP each). The 4-bit formats have 128 weights per word, and one
+// multiplier gives the sum of two of their products: with the weights as unsigned values u (Q4_0 the nibble, Q5_K
+// nibble + 16 h, Q6_K the 6 bits) and activations xa, xb,
+//     (xa * 2^10 + ua) * (xb * 2^10 + ub) = xa xb * 2^20 + (xa ub + xb ua) * 2^10 + ua ub,
+// so bits 24:10 hold xa ub + xb ua after two corrections. The 5 low bits of xa xb reach the field from above: the
+// multiplier subtracts them at bit 20. ua ub reaches it from below only for Q6_K (ua ub >= 1024): c = ua ub >> 10
+// is at most 3. The multiplier also subtracts the 2 low bits of the sum at bit 10 (simple logic of the operands'
+// low bits): c is then alone in bits 11:10 and drops out, and the 2 low bits are added after the sum. The signed
+// weights are u - 8 (Q4_0) and u - 32 (Q6_K): the engine subtracts 8 or 32 times the sum of the activations, which
+// the quantizer delivers (xs). All of it is exact integer arithmetic.
+// Q8_0 has 64 weights per word: a multiplier gets (xa * 2^10) * (w + 128) with one int8 weight w, the product in
+// bits 25:10, and the engine subtracts 128 times the sum of the block's activations.
 // A row may also be computed in column blocks (gemvqc16's column-blocked GEMV): one call per block, blocks_per_row
 // then counts the block's columns. The row sums of a block go to racc (indexed by the row of the call) and the next
 // block adds to them (not first); only the last block writes row_results. The fixed-point sum does not depend on the
@@ -505,79 +524,116 @@ void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, 
             float lane_term[4];
 #endif
             int lane_s[4], lane_m[4];
+            int lane_dot[4], lane_half0[4], lane_half1[4], lane_xsum[4];
+#pragma HLS ARRAY_PARTITION variable=lane_dot complete
+#pragma HLS ARRAY_PARTITION variable=lane_half0 complete
+#pragma HLS ARRAY_PARTITION variable=lane_half1 complete
+#pragma HLS ARRAY_PARTITION variable=lane_xsum complete
 #pragma HLS ARRAY_PARTITION variable=lane_term complete
 #pragma HLS ARRAY_PARTITION variable=lane_s complete
 #pragma HLS ARRAY_PARTITION variable=lane_m complete
             for (unsigned k = 0; k < 4; ++k) {
 #pragma HLS UNROLL
-                // Q8_0 lanes 0/1 read blocks x_base + k (x_base 0 or 2), all other cases and lanes read block k.
+                // Q8_0 lanes 0/1 read the scales of blocks x_base + k (x_base 0 or 2), all other cases block k.
                 const unsigned xb = k < 2 ? ((x_base & 2U) ? k + 2U : k) : k;
-                // Select the lane's activation block once with constant ranges: indexing bytes of the 1024-bit
-                // word with a variable offset would build one wide mux per byte.
-                ap_uint<256> x_block;
-                switch (xb) {
-                case 0: x_block = xq.range(255, 0); break;
-                case 1: x_block = xq.range(511, 256); break;
-                case 2: x_block = xq.range(767, 512); break;
-                default: x_block = xq.range(1023, 768); break;
-                }
+                // The 16 multipliers of lane k. 4-bit formats: the 32 weights of the lane (activation block k).
+                // Q8_0: block k % 2 of the word with activation block x_base + k % 2. The lane whose own activation
+                // block that is (k or k ^ 2) takes the even elements, the other lane the odd ones: multiplier p reads
+                // its first activation from its own block or from the other block's odd element, a 2:1 select.
+                // All ranges have constant bounds.
+                const ap_uint<256> x_packed = xq.range(256 * k + 255, 256 * k);
+                const ap_uint<256> x_other = xq.range(256 * (k ^ 2U) + 255, 256 * (k ^ 2U));
+                const bool odd8 = q8 && ((x_base & 2U) != 0) != (k >= 2);  // Q8_0: this lane has the odd elements
                 // K-quant high bits of this lane: Q5_K one bit per weight of sub-block k or 4 + k (meta word),
                 // Q6_K two bits per weight of super-block weights 128w + 32k .. + 31 (high-bit word).
                 const ap_uint<32> high5 = k_second ? scales.range(160 + 32 * (4 + k) + 31, 160 + 32 * (4 + k))
                                                    : scales.range(160 + 32 * k + 31, 160 + 32 * k);
                 const ap_uint<64> high6 = k_second ? scales2.range(256 + 64 * k + 63, 256 + 64 * k)
                                                    : scales2.range(64 * k + 63, 64 * k);
-                int products[32];
-#pragma HLS ARRAY_PARTITION variable=products complete
+                ap_uint<6> u[32];  // the lane's weights as unsigned values, wired from nibble and high bits
+#pragma HLS ARRAY_PARTITION variable=u complete
                 for (unsigned i = 0; i < 32; ++i) {
 #pragma HLS UNROLL
-                    // The weight as an 8-bit pattern, wired from nibble and high bits without arithmetic, so all
-                    // formats share one 8x8 multiplier per weight: Q4_0 nibble - 8 = {~n3 x5, n2..n0}; Q5_K
-                    // nibble + 16 h = {000, h, n}; Q6_K (h1 h0 n) - 32 = {~h1 x3, h0, n}; Q4_1 {0000, n}.
                     const ap_uint<8> q4_byte = word.range((k * 16 + (i & 15)) * 8 + 7, (k * 16 + (i & 15)) * 8);
                     const ap_uint<4> nibble = i < 16 ? q4_byte.range(3, 0) : q4_byte.range(7, 4);
-                    const bool h1 = high6[2 * i + 1], h0 = k6 ? bool(high6[2 * i]) : (k5 && high5[i]);
-                    ap_uint<8> pattern;
-                    if (q8) {
-                        pattern = k < 2 ? ap_uint<8>(word.range((k * 32 + i) * 8 + 7, (k * 32 + i) * 8)) : ap_uint<8>(0);
-                    } else if (q4) {
-                        pattern = (ap_uint<5>(nibble[3] ? 0 : 31), ap_uint<3>(nibble.range(2, 0)));
-                    } else {
-                        pattern = (ap_uint<3>(k6 && !h1 ? 7 : 0), ap_uint<1>(h0), nibble);
-                    }
-                    const int weight = int(ap_int<8>(pattern));
-                    const int activation = int(ap_int<8>(x_block.range(i * 8 + 7, i * 8)));
-                    products[i] = weight * activation;
+                    const bool h1 = k6 && high6[2 * i + 1], h0 = k6 ? bool(high6[2 * i]) : (k5 && high5[i]);
+                    u[i] = (ap_uint<1>(h1), ap_uint<1>(h0), nibble);
                 }
-                int level[16];
-#pragma HLS ARRAY_PARTITION variable=level complete
-                for (unsigned i = 0; i < 16; ++i) {
+                // Multiplier p: weights 2p and 2p + 1 of the lane (Q8_0: one weight). Its sum of products is
+                // 4 * quad[p] + rest[p].
+                ap_int<14> quad[16];
+                ap_uint<2> rest[16];
+#pragma HLS ARRAY_PARTITION variable=quad complete
+#pragma HLS ARRAY_PARTITION variable=rest complete
+                for (unsigned p = 0; p < 16; ++p) {
 #pragma HLS UNROLL
-                    level[i] = products[2 * i] + products[2 * i + 1];
+                    const ap_int<8> xa = odd8 ? ap_int<8>(x_other.range(p * 16 + 15, p * 16 + 8))
+                                              : ap_int<8>(x_packed.range(p * 16 + 7, p * 16));
+                    const ap_int<8> xb2 = q8 ? ap_int<8>(0) : ap_int<8>(x_packed.range(p * 16 + 15, p * 16 + 8));
+                    const ap_uint<6> ua = q8 ? ap_uint<6>(0) : u[2 * p + 1];
+                    // Q8_0: the int8 weight plus 128 (element 2p or 2p + 1 of block k % 2).
+                    const unsigned b8 = 32 * (k % 2) + 2 * p;
+                    const ap_uint<8> w8 = odd8 ? word.range((b8 + 1) * 8 + 7, (b8 + 1) * 8) : word.range(b8 * 8 + 7, b8 * 8);
+                    const ap_uint<8> ub = q8 ? ap_uint<8>(w8 ^ ap_uint<8>(0x80)) : ap_uint<8>(u[2 * p]);
+                    const ap_int<18> fa = (xa, ap_uint<4>(0), ua);
+                    const ap_int<18> fb = (xb2, ap_uint<2>(0), ub);
+                    // The multiplier subtracts the 5 low bits of xa * xb at bit 20 and m = (xa ub + xb ua) mod 4 at
+                    // bit 10. Bits 24:12 are then (xa ub + xb ua - m) / 4, and c stays in bits 11:10.
+                    const ap_uint<5> low = ap_uint<5>(xa.range(4, 0)) * ap_uint<5>(xb2.range(4, 0));
+#pragma HLS BIND_OP variable=low op=mul impl=fabric
+                    const bool a0 = xa[0] && ub[0], b0 = xb2[0] && ua[0];
+                    const bool m0 = a0 != b0;
+                    const bool m1 = ((xa[1] && ub[0]) != (xa[0] && ub[1])) !=
+                                    (((xb2[1] && ua[0]) != (xb2[0] && ua[1])) != (a0 && b0));
+                    rest[p] = (ap_uint<1>(m1), ap_uint<1>(m0));
+                    const ap_uint<25> fix = (low, ap_uint<8>(0), rest[p], ap_uint<10>(0));
+                    const ap_int<37> product = fa * fb - ap_int<37>(fix);
+                    quad[p] = (ap_uint<1>(q8 ? product[25] : product[24]), ap_uint<13>(product.range(24, 12)));
                 }
-                for (unsigned width = 8; width >= 2; width >>= 1) {
+                int half_sum[2];
+#pragma HLS ARRAY_PARTITION variable=half_sum complete
+                for (unsigned h = 0; h < 2; ++h) {
 #pragma HLS UNROLL
-                    for (unsigned i = 0; i < width; ++i) {
-#pragma HLS UNROLL
-                        level[i] = level[2 * i] + level[2 * i + 1];
-                    }
+                    const unsigned b = 8 * h;
+                    const ap_int<17> quads = ((quad[b] + quad[b + 1]) + (quad[b + 2] + quad[b + 3])) +
+                                             ((quad[b + 4] + quad[b + 5]) + (quad[b + 6] + quad[b + 7]));
+                    const ap_uint<5> rests = ((rest[b] + rest[b + 1]) + (rest[b + 2] + rest[b + 3])) +
+                                             ((rest[b + 4] + rest[b + 5]) + (rest[b + 6] + rest[b + 7]));
+                    half_sum[h] = int(quads) * 4 + int(rests);
                 }
-                const int half0 = level[0], half1 = level[1];  // weights 0..15 and 16..31 of the lane
-                const int dot = half0 + half1;
+                // Sums of the activations: Q8_0 quantizer one per block (bits 31:16 of the lane), Q8_K one per 16.
+                const ap_int<13> x_sum = xs.range(k * 32 + 28, k * 32 + 16);
+                const ap_int<12> x_sum_a = xs.range(32 + 24 * k + 11, 32 + 24 * k);
+                const ap_int<12> x_sum_b = xs.range(32 + 24 * k + 23, 32 + 24 * k + 12);
+                const int offset_a = k6 ? int(x_sum_a) * 32 : (q4 ? int(x_sum) * 8 : 0);  // Q8_0: below
+                const int offset_b = k6 ? int(x_sum_b) * 32 : 0;
+                const int half0 = half_sum[0] - offset_a, half1 = half_sum[1] - offset_b;  // weights 0..15, 16..31
+                lane_dot[k] = half0 + half1;
+                // Q8_0: block k is the multipliers of lanes k and k + 2, added below.
+                lane_half0[k] = half0;
+                lane_half1[k] = half1;
+                lane_xsum[k] = int(x_sum_a) + int(x_sum_b);
+            }
+            for (unsigned k = 0; k < 4; ++k) {
+#pragma HLS UNROLL
+                const unsigned xb = k < 2 ? ((x_base & 2U) ? k + 2U : k) : k;
+                // Widths: 32 * 128 * 128 for a Q8_0 block, 32 * 128 * 15 for a lane of the 4-bit formats.
+                const ap_int<18> dot4 = lane_dot[k];
+                const ap_int<13> x_sum8 = xs.range(xb * 32 + 28, xb * 32 + 16);
+                const ap_int<21> dot8 = k < 2 ? lane_dot[k] + lane_dot[k + 2] - int(x_sum8) * 128 : 0;
+                const int dot = k < 2 && q8 ? int(dot8) : int(dot4);
+                const int half0 = lane_half0[k], half1 = lane_half1[k];
                 const unsigned si = (s_base + k) & 31U;
                 const bool active = k < bpw;
 #if GEMVQ_INT_SCALE
-                lane_term[k] = scale_lane_fixed(dot, scales.range(si * 16 + 15, si * 16), xs.range(xb * 32 + 31, xb * 32),
-                                                active, q41);
                 lane_min[k] = q41 && active ? half_bits_to_float(scales2.range(si * 16 + 15, si * 16)) *
                                                   half_bits_to_float(xs.range(xb * 32 + 31, xb * 32 + 16))
                                             : 0.0f;
 #else
                 const float weight_scale = half_bits_to_float(scales.range(si * 16 + 15, si * 16));
-                // Q4_0/Q8_0: xs holds the FP32 activation scale. Q4_1 (ggml: (d4 * d8) * sumi + m4 * s8): xs holds d8
-                // and s8 as FP16, the m word the weight minima. One multiply path serves all three formats.
-                const float x_scale = q41 ? half_bits_to_float(xs.range(xb * 32 + 15, xb * 32))
-                                          : bits_to_float(xs.range(xb * 32 + 31, xb * 32).to_uint());
+                // xs holds the FP16 activation scale. Q4_1 (ggml: (d4 * d8) * sumi + m4 * s8): xs holds d8 and s8 as
+                // FP16, the m word the weight minima. One multiply path serves all three formats.
+                const float x_scale = half_bits_to_float(xs.range(xb * 32 + 15, xb * 32));
                 const float min_term = q41 ? half_bits_to_float(scales2.range(si * 16 + 15, si * 16)) *
                                                  half_bits_to_float(xs.range(xb * 32 + 31, xb * 32 + 16))
                                            : 0.0f;
@@ -599,13 +655,21 @@ void compute_words(hls::stream<ap_uint<512>> & words, const xq_word * local_xq, 
                 const ap_uint<6> mn5 = k_second ? ap_uint<6>(scales.range(96 + 8 * (4 + k) + 5, 96 + 8 * (4 + k)))
                                                 : ap_uint<6>(scales.range(96 + 8 * k + 5, 96 + 8 * k));
                 // Two scale products per lane (Q5_K: the same scale twice) and the Q5_K min product, in DSPs.
+#if GEMVQ_INT_SCALE
+                const lane_scaled scaled = scale_lane_fixed(kq, dot, scales.range(si * 16 + 15, si * 16),
+                                                            xs.range(xb * 32 + 15, xb * 32), active, sc_a, sc_b,
+                                                            ap_int<20>(half0), ap_int<20>(half1));
+                lane_term[k] = scaled.term;
+                lane_s[k] = scaled.s_sum;
+#else
                 const int scaled_a = int(sc_a * ap_int<20>(half0));
 #pragma HLS BIND_OP variable=scaled_a op=mul impl=dsp
                 const int scaled_b = int(sc_b * ap_int<20>(half1));
 #pragma HLS BIND_OP variable=scaled_b op=mul impl=dsp
-                const int min_product = int(mn5 * ap_int<16>(xs.range(47 + 16 * k, 32 + 16 * k)));
-#pragma HLS BIND_OP variable=min_product op=mul impl=dsp
                 lane_s[k] = scaled_a + scaled_b;
+#endif
+                const int min_product = int(mn5 * ap_int<13>(lane_xsum[k]));
+#pragma HLS BIND_OP variable=min_product op=mul impl=dsp
                 lane_m[k] = k5 ? min_product : 0;
             }
             // The lanes of one word are summed in FP32 and converted once: a single variable shift per word

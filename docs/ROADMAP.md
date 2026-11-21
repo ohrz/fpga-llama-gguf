@@ -166,6 +166,16 @@ The host needs 3–6 ms for each token (refer to [DESIGN.md](DESIGN.md#4-time-fo
 
   The target is 900–1000 fewer DSPs outside the engines. The known candidates give 400–600 DSPs.
 
+  Status (kernel source, HLS estimate, no bitstream): the kernel has 758 fewer DSPs (4025 to 3267). The results
+  have the same bits.
+  - Each engine has 86 DSPs instead of 120 (−680 DSPs for 20 engines). One DSP multiplier calculates the sum of
+    two 4-bit weight products. The K-quant scale products and the FP16 scale products use the same two multipliers
+    in each lane.
+  - The DeltaNet load and the norms share one unit for the sum of squares (−78 DSPs).
+  - The LUT estimate increases by 72,000 (+9 %): about 3,800 for each engine. The routed LUT count is not
+    known.
+  - Not done: the host metadata, the shared unit for exp, div, sqrt and log, and the two kernels.
+
 HLS results for one engine (`xcu50`, estimates before implementation):
 
 | Engine variant | Rows for each clock | LUT | DSP |
@@ -210,7 +220,7 @@ release was `b12602`. The build script can use it: `LLAMA_CPP_VERSION=b12602 scr
 | U2 | Fusions on the new graph | completed in the emulator. The same run has 174 graph calls with the two versions |
 | U5 | New L2 norm formula in the DeltaNet command | completed in the kernel source and in the emulator. The card needs a new bitstream. Estimated gain: 0.3 ms for each token |
 | U3 | Fused Qwen3.5 weights (`wqkv_z`, `ssm_beta_alpha_cat`) | open. Fewer and larger GEMV groups |
-| U4 | Measurement on the card | open. Compare the two versions with the same bitstream |
+| U4 | Measurement on the card | completed (2026-11-21, current bitstream). All checked operations agree, and the text is the same as on the CPU. `b12602` is 0.43–0.49 ms slower for each token than `b9972` (4B Q4_0: 30.29 tokens/s, `b9972`: 30.69). The bitstream does not have U5, so the backend uses two RMSNORM commands for each DeltaNet layer |
 
 Changes that were necessary for U1 and U2:
 
@@ -281,9 +291,9 @@ prompt. This is the reason for the different number of checked operations in the
 | Step | Content | Token time 4B Q4_0 | Tokens/s 4B Q4_0 |
 | --- | --- | --- | --- |
 | current | 20 engines, 94.8 MHz (measured) | 32.6 ms | 30.7 |
-| 1 | U4: measure llama.cpp `b12602` on the card (U2 is complete) | open (estimate: +0.3 ms with the current bitstream) | open |
+| 1 | U4: measure llama.cpp `b12602` on the card (U2 is complete) | 33.0 ms (measured, +0.43 ms) | 30.3 |
 | 2 | C1: measure the port bandwidth | as current | as current |
-| 3 | C5: area reduction, target ≤ 3300 DSPs | as current | as current |
+| 3 | C5: area reduction, target ≤ 3300 DSPs (kernel source: 3267 DSPs, HLS estimate) | as current | as current |
 | 4 | A7 two-phase DeltaNet step, B3 Q4_1 on the card | ≈ 29.6 ms | ≈ 34 |
 | 5 | Two kernels, then C2: two times the bandwidth for Q4_0 and Q8_0 | ≈ 21.6 ms | ≈ 46 |
 | 5 (alternative) | Two kernels, then C6 at 190 MHz: two times the bandwidth for all formats | ≈ 18.6 ms | ≈ 54 |

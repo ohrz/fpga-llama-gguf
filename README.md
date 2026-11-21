@@ -95,7 +95,7 @@ For the full flow diagram and more data, refer to [docs/DESIGN.md](docs/DESIGN.m
 | --- | --- |
 | Card | AMD Alveo U50 (`xcu50-fsvh2104-2-e`, 8 GB HBM2), deployment platform `xilinx_u50_gen3x16_xdma_5_202210_1` |
 | Host | Linux (Ubuntu 24.04), x86-64, GCC 13, CMake 3.14 or later, Ninja, git |
-| Run time | AMD XRT 2.26.0 (upstream commit `11169ba5`) with its `xocl` driver |
+| Run time | AMD XRT 2.26.0 (upstream tag `202620.2.26.149`, commit `ca87dd5c`) with its `xocl` driver |
 | Bitstream build | **Vitis / Vivado 2025.2** (with Vitis HLS), 48 GB RAM, 3–4 hours |
 | llama.cpp | commit **`c92e806d1c81091c9035edce99c35374da1b465e`** (11 July 2026) with the patches of this repository |
 

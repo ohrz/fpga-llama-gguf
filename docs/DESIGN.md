@@ -108,6 +108,11 @@ Each fused form gives the same values as the plain command sequence.
   scales (weight and activation) exactly on the significands. It adds the product to an 80-bit fixed-point
   accumulator. At the end of the row, it rounds to FP32 one time. The result does not depend on the sequence of the
   additions.
+- An engine has 64 DSP multipliers for the products of a word. One multiplier calculates the sum of two products
+  of 4-bit weights (Q4_0, Q5_K, Q6_K). For Q8_0, one multiplier calculates one product. The engine uses the weights
+  without their offset (Q4_0: 8, Q6_K: 32, Q8_0: 128). It then subtracts the offset times the sum of the
+  activations. The quantizer supplies these sums. The two scale multipliers of a lane are shared by the formats.
+  The result has the same bits as a calculation with one multiplier for each product.
 - The quantizer quantizes the activation vector as ggml does for the related weight type. It uses `Q8_0` for Q4_0
   and Q8_0 weights, and `Q8_K` for Q5_K and Q6_K weights. All engines get the same quantized vector.
 - K-quants use super-blocks of 256 weights: one metadata word with the scales, then the quant words.

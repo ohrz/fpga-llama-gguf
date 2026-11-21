@@ -360,7 +360,8 @@ void head_scales(const vword * buf, unsigned heads, float eps, bool l2, bool l2_
 #pragma HLS ARRAY_PARTITION variable=part complete
     GDN_HEAD_SUM: for (unsigned i = 0; i < heads * SW; ++i) {
 #pragma HLS PIPELINE II=1
-        part[i % SW] = gemvqc_ops::sumsq16(buf[i]);
+        const vword w = buf[i];  // a copy, as in rownorm: the three users then share one sumsq16
+        part[i % SW] = gemvqc_ops::sumsq16(w);
         if (i % SW == SW - 1U) {
             scale[i / SW] = gemvqc_ops::row_scale(part[7], part[6], part[5], part[4], part[3], part[2], part[1], part[0],
                                                   S, eps, l2, l2_sum);

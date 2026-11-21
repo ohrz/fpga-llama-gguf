@@ -18,7 +18,7 @@
 #   CMAKE_EXTRA    extra CMake arguments, e.g. "-DGGML_NATIVE=OFF -DGGML_AVX2=ON"
 #   LLAMA_CPP_REPO llama.cpp git URL                               (default https://github.com/ggml-org/llama.cpp)
 #   LLAMA_CPP_VERSION  llama.cpp release: b9972 (default; all measured values use it) or b12602 (tested with the
-#                  emulator only)
+#                  emulator and on the card; slower on the current bitstream)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
