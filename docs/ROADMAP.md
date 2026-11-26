@@ -1,7 +1,7 @@
 # Roadmap: faster decode and prompt
 
-Status 2026-11-21. This document gives the possible changes, their cost and their sequence. The values of open
-items are estimates. The measured values come from [DESIGN.md](DESIGN.md#4-time-for-each-token).
+This document gives the status of 2026-11-21. It gives the possible changes, their cost and their sequence. The
+values of open items are estimates. The measured values come from [DESIGN.md](DESIGN.md#4-time-for-each-token).
 
 The data in this document have three sources:
 
@@ -26,8 +26,8 @@ The data in this document have three sources:
 Two area changes (LUTRAM buffers, adders in LUTs) made the design unroutable. We removed them. On the U50, the LUTs
 limit the routing more than the DSPs.
 
-A2 and A3 alone gave no net gain on the card. The `z` projection moved out of the DeltaNet pass, and the clock
-decreased by 1 %. The table in the [README](../README.md#performance-history) shows the values of each step.
+A2 and A3 alone gave no net gain on the card. A2 put the `z` projection into the qkv group. Before A2, the DeltaNet
+pass hid this projection. The clock decreased by 1 %. The table in the [README](../README.md#performance-history) shows the values of each step.
 
 ## 2. Limits of the current design
 
@@ -53,18 +53,19 @@ larger gain, the bandwidth must increase.
 2. **Bandwidth for each port.** An engine port moves 6.07 GB/s. Published measurements report 12.9 to 13.2 GB/s for
    one HBM channel ([Choi et al.](https://arxiv.org/abs/2010.06075)). We did not measure this value. If it is
    correct, the engine ports use less than half of their channels.
-3. **Bandwidth and compute change together.** A 64-byte word holds 128 Q4_0 values. An engine calculates 128 products
-   for each cycle. For 20 engines, this is 243 GMAC/s. Qwen3.5-4B Q4_0 needs 4.4 GMAC for each token. At the
-   streaming limit, 88 % of the multipliers are busy. For this reason, more bandwidth needs more multipliers or a
-   higher engine clock.
+3. **Bandwidth and compute change together.** A 64-byte word holds 128 Q4_0 values. An engine calculates 128
+   products for each cycle. For 20 engines, this is 243 GMAC/s.
+
+   Qwen3.5-4B Q4_0 needs 4.4 GMAC for each token. At the streaming limit, 88 % of the multipliers are busy. For
+   this reason, more bandwidth needs more multipliers or a higher engine clock.
 4. **Area.** The kernel uses 78 % of the DSPs and 64 % of the LUTs. The HBM-side SLR is the limit for the routing.
    A test build with 2 % more LUTs did not route.
 5. **Clock.** The kernel runs at 94.8 MHz. The worst paths are in the DeltaNet stages and in the command loop
-   (17–23 logic levels). They are not in the engines (refer to section 3.3). The platform HBM interconnect does not
-   meet 450 MHz.
+   (17–23 logic levels). They are not in the engines (refer to section 3.3). The HBM interconnect of the platform
+   does not meet 450 MHz.
 6. **Prompt.** The prompt is compute-bound. 512 tokens × 4.4 GMAC = 2.25 TMAC. The host CPU calculates
-   280 GMAC/s, the engines a maximum of 243 GMAC/s. With the current multipliers, the card cannot be faster than
-   a CPU with 16 cores for the prompt.
+   280 GMAC/s. The engines calculate a maximum of 243 GMAC/s. With the current multipliers, the card cannot be
+   faster than a CPU with 16 cores for the prompt.
 
 ### 2.3 Content of the weight stream
 
@@ -97,7 +98,8 @@ The K-quant matrices are 27 % of the stream. A change that makes only Q4_0 two t
 
 **A7 in detail.** The step calculates the output from the new state `S' = x + k·δ`. The two-phase form calculates
 the output as `(x·q) + δ·(k·q)`. The output then does not wait for the new state. A C++ study with 1.6 million
-values gave the same accuracy for the two forms: mean relative error 1.18e-07 (current) and 1.14e-07 (two phases).
+values gave the same accuracy for the two forms. The mean relative error was 1.18e-07 (current form) and 1.14e-07
+(two phases).
 
 The kernel source has this form as a build switch (`GEMVQC_GDN_TWO_PHASE` in `fpga/src/gemvqc16.h`, default 0).
 The default kernel does not change: its HLS estimate is the same as before.
@@ -124,12 +126,13 @@ Results:
 | HLS estimate | +356 DSPs, +23,800 LUTs, +33,700 FFs, +8 BRAMs. The clock estimate is the same |
 
 One head needs 264 cycles in the step. The default kernel needs 512 cycles. The 4B model has 24 DeltaNet layers
-with 32 heads. Thus the estimated gain is 190,000 cycles or 2.0 ms for each token at 94.8 MHz. This is an estimate
-from the cycle count. It is not a measurement on the card.
+with 32 heads. For this model, the estimated gain is 190,000 cycles or 2.0 ms for each token at 94.8 MHz. This is
+an estimate from the cycle count. It is not a measurement on the card.
 
 The state update needs two clocks for each word. The default kernel needs one clock to write a word. If the GEMV
 passes after a step are too short, the kernel adds a pass for the remaining words. In the test list, this pass
-adds 1,817 cycles after the last command. The GEMV passes of a 4B layer are much longer than those of the test list.
+adds 1,817 cycles after the last command. The GEMV passes of a 4B layer are much longer than the GEMV passes of the
+test list.
 
 The first estimate of the cost (130 to 190 DSPs) was too low. The output path needs three multipliers for each
 lane, not two. We did not build a bitstream with this switch. The design has no free area for it before C5.
@@ -140,17 +143,21 @@ The host needs 3–6 ms for each token (refer to [DESIGN.md](DESIGN.md#4-time-fo
 
 - **B1 Attention on the card.** This change puts the F16 KV cache into HBM on free ports. New opcodes do KV append,
   scores with softmax, and softmax × V. The change removes up to 8 of the 14 launches and the CPU attention. The
-  estimated gain is 3–5 ms for each token. The numerics must follow the F16 path of the CPU. It is possible only
-  as a separate vector kernel in the second SLR (C5).
+  estimated gain is 3–5 ms for each token.
+
+  The numerics must follow the F16 path of the CPU. B1 is possible only as a separate vector kernel in the second
+  SLR (C5).
 - **B2 One launch for each token.** B1 makes this possible. Gain: 1–2 ms of synchronization.
 - **B3 Q4_1 matrices on the card.** A Q4_1 weight is `d·q + m`. The added term is `m` × the block sum of the
-  input. The quantizer can supply the block sum. The scale lanes of the engine can calculate the product. This form
-  needs some hundred LUTs for each engine (estimate, no synthesis). The earlier form needed +84 k LUT. The gain is
-  1 ms and four launches.
+  input. The quantizer can supply the block sum. The scale lanes of the engine can calculate the product.
+
+  This form needs some hundred LUTs for each engine (estimate, no synthesis). The earlier form needed +84 k LUT.
+  The gain is 1 ms and four launches.
 
 ### 3.3 Higher bandwidth limit
 
-- **C1 HBM bandwidth probe.** One link measures the throughput of one port on one channel at 256 bits. Changes
+- **C1 Measurement of the HBM bandwidth.** One link measures the throughput of one port on one channel at
+  256 bits. Changes
   C2 and C6 need 12.1 GB/s. **This is the most important open measurement.**
 - **C2 Two rows for each engine.** A two-row engine reads 128 bytes for each clock. It needs an HBM clock of
   380 MHz or more.
@@ -172,8 +179,8 @@ The host needs 3–6 ms for each token (refer to [DESIGN.md](DESIGN.md#4-time-fo
     two 4-bit weight products. The K-quant scale products and the FP16 scale products use the same two multipliers
     in each lane.
   - The DeltaNet load and the norms share one unit for the sum of squares (−78 DSPs).
-  - The LUT estimate increases by 72,000 (+9 %): about 3,800 for each engine. The routed LUT count is not
-    known.
+  - The LUT estimate increases by 72,000 (+9 %): about 3,800 for each engine. We do not know the LUT count after
+    routing.
   - Not done: the host metadata, the shared unit for exp, div, sqrt and log, and the two kernels.
 
 HLS results for one engine (`xcu50`, estimates before implementation):
@@ -194,7 +201,7 @@ Conclusions:
 
 - The K-quant path is 5.9 k LUT and 22 DSPs of each engine. The Q8_0 path is 4.5 k LUT.
 - A two-row engine for Q4_0 and Q8_0 needs 17 % more LUTs and 56 % more DSPs than the current engine.
-- With a one-row K-quant path, 20 two-row engines need approximately 1500 more DSPs (estimate). They do not fit
+- With a one-row K-quant path, 20 two-row engines need about 1500 more DSPs (estimate). They do not fit
   into the current chip. C2 is possible only after C5.
 - A higher clock target changes the engine area by less than 2 %. The engine is not the cause of the 94.8 MHz.
 
@@ -204,8 +211,8 @@ A batch path in the engines (P2) reads a weight word one time and multiplies it 
 uses are possible:
 
 - **Speculative decode.** The card checks k draft tokens in one weight pass. A test with the available MTP model
-  gave an acceptance of 4–7 % only. Newer llama.cpp versions have more draft types and can restore the recurrent
-  state (refer to section 3.5).
+  gave an acceptance of 4–7 % only. Newer llama.cpp versions have more draft types. They can also restore the
+  recurrent state (refer to section 3.5).
 - **More sequences.** The card decodes more than one sequence in one pass. For Q8_0, two sequences have no
   compute cost. For Q4_0, the multiplier limit (section 2.2, item 3) limits the gain.
 
@@ -232,6 +239,7 @@ Changes that were necessary for U1 and U2:
 **Cause of the missing fusions.** llama.cpp `b12602` calculates the L2 norm of q and k as `RMS_NORM` and `SCALE`.
 The backend did not accept this `SCALE`. The CPU calculated it. This divided each DeltaNet layer into five splits.
 The convolution and the DeltaNet step were then in different splits, and the fusions between them were not possible.
+
 The backend now sends the `RMS_NORM` and its `SCALE` to the card as one `RMSNORM` command with a constant weight.
 All other fusions are the same as with `b9972`: the convolution epilog, the gates, the gated norm and `ssm_out`
 in the DeltaNet pass.
@@ -244,14 +252,16 @@ in the DeltaNet pass.
 | `b12602` | `x / sqrt(sum + eps)` | `RMSNORM` command with a constant weight | part of the DeltaNet command (flag `GEMVQC_GDN_L2_SUM`) |
 
 We tested the old formula in the DeltaNet command with the new graph. The emulator check failed in layer 1. The
-smallest sum of squares of a head was 0.006, and the relative difference was 8e-5. Thus, with the current
-bitstream, the backend uses the exact form. Each DeltaNet layer has two more `RMSNORM` commands (2048 values
-each). The estimated cost is 0.3 ms for each token. This estimate uses the measured mean time of the norm commands
-(approximately 6 µs).
+smallest sum of squares of a head was 0.006, and the relative difference was 8e-5. Because of this, the backend
+uses the exact form with the current bitstream.
+
+Each DeltaNet layer has two more `RMSNORM` commands (2048 values each). The estimated cost is 0.3 ms for each
+token. This estimate uses the measured mean time of the norm commands (about 6 µs).
 
 The kernel source now has the new formula in the DeltaNet command. The two formulas use the same square root and
-the same divider. A feature bit shows the backend that the kernel has the new flag. If the bit is not set, the
-backend uses the `RMSNORM` commands. Thus the backend operates with the two bitstreams. The results:
+the same divider. A feature bit shows the backend that the kernel has the new flag. If the kernel does not have
+this bit, the backend uses the `RMSNORM` commands. Because of this, the backend operates with the old bitstream and
+with the new bitstream. The results:
 
 - C simulation of the kernel: 193 of 193 cases agree. The new command gives the same bits as a DeltaNet step with
   q and k that the host normalized.
@@ -264,8 +274,8 @@ backend uses the `RMSNORM` commands. Thus the backend operates with the two bits
 We did not build a bitstream with this kernel source. The measured bitstream does not have the new flag.
 
 In `b12602`, the graph selects the output token before the last residual addition. In `b9972`, it selects the
-output token after the last norm. Thus, with `b12602`, the card also calculates the end of the last layer of a
-prompt. This is the reason for the different number of checked operations in the two versions.
+output token after the last norm. Because of this, with `b12602`, the card also calculates the end of the last
+layer of a prompt. This is the reason for the different number of checked operations in the two versions.
 
 ### 3.6 Changes that we examined and do not use
 
@@ -310,10 +320,11 @@ estimates. They are not results. The estimates use these assumptions:
 - B1 and B2 decrease the host time to 1 ms.
 - We assume that one HBM channel supplies 12.6 GB/s. In step 7, this value limits the Q4_0 stream. The K-quant
   stream gets the full gain of the clock.
-- The other card time (3.5 ms) does not change. If it decreases to half, the limit is approximately 70 tokens/s.
+- The other card time (3.5 ms) does not change. If it decreases to half, the limit is about 70 tokens/s.
 
-C6 at 190 MHz gives a larger gain than C2, because it also makes the K-quant stream two times faster. It needs
-almost no engine area. But it needs timing closure of the engine kernel at two times the current clock.
+C6 at 190 MHz gives a larger gain than C2, because it also makes the K-quant stream two times faster. A higher
+clock target changes the engine area by less than 2 % (section 3.3). But C6 needs timing closure of the engine
+kernel at two times the current clock.
 
 Reasons for this sequence:
 
@@ -336,4 +347,5 @@ Reasons for this sequence:
   the logit difference becomes the acceptance criterion.
 - More area can decrease the clock. After each link, compare the GEMV count and the launch count for each token in
   the cycle trace with the earlier state.
-- A matrix that goes to the CPU without a message is almost not visible in tokens/s. The launch count shows it.
+- If a matrix goes to the CPU without a message, the change in tokens/s is small. The launch count shows this
+  change.

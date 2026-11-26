@@ -11,11 +11,11 @@ You need the two items to run on the card.
 
 | Component | Version used | Notes |
 | --- | --- | --- |
-| Alveo U50 card | `xcu50-fsvh2104-2-e`, 8 GB HBM2 | one card. The backend opens device 0 if `GGML_XRT_DEVICE` is not set |
+| Alveo U50 card | `xcu50-fsvh2104-2-e`, 8 GB HBM2 | one card. The backend opens device 0 if you do not set `GGML_XRT_DEVICE` |
 | Platform | `xilinx_u50_gen3x16_xdma_5_202210_1` | deployment platform on the card, development platform in `/opt/xilinx/platforms` (for `v++`) |
 | XRT | 2.26.0, upstream tag `202620.2.26.149` (commit `ca87dd5c`). Before 2026-11-21: commit `11169ba5` | headers and `libxrt_coreutil` for the build, `xocl` driver at run time. The two versions gave the same texts and the same speed (2026-11-21). After an XRT update, build the host programs again |
 | Vitis / Vivado / Vitis HLS | **2025.2** | only for the bitstream and the emulator |
-| OS / compiler | Ubuntu 24.04, GCC 13.3, CMake 3.28, Ninja 1.11, git | other Linux toolchains are not tested |
+| OS / compiler | Ubuntu 24.04, GCC 13.3, CMake 3.28, Ninja 1.11, git | we did not test other Linux toolchains |
 | llama.cpp | `c92e806d1c81091c9035edce99c35374da1b465e` (release `b9972`) | `scripts/build_llama.sh` downloads this commit. `LLAMA_CPP_VERSION=b12602` selects commit `418fe97b5f01b11eeb89f30d8a0459433edbf1d2`, tested in the emulator and on the card |
 
 1. Install the U50 platform and XRT. Use the Alveo U50 documentation of AMD.
@@ -26,9 +26,9 @@ You need the two items to run on the card.
    xbutil examine
    ```
 
-The backend uses only the public XRT C++ API (`xrt::device`, `xrt::bo`, `xrt::kernel`, `xrt::ip`). We did not
-test other XRT or platform versions. XRT 2.26 marks `load_xclbin` and the `xrt::ip` constructor as deprecated. The
-compiler shows warnings for them. These warnings have no effect.
+The backend uses only the public C++ API of XRT (`xrt::device`, `xrt::bo`, `xrt::kernel`, `xrt::ip`). We did not
+test XRT versions or platform versions other than the versions in the table. XRT 2.26 marks `load_xclbin` and the
+`xrt::ip` constructor as deprecated. The compiler shows warnings for them. These warnings have no effect.
 
 ## 2. llama.cpp with the U50 backend
 
@@ -69,7 +69,7 @@ The binaries are in `build/llama.cpp/build/bin`.
 scripts/build_xclbin.sh
 ```
 
-The script runs two steps for the U50 platform. The result is `build/xclbin/gemvqc16.xclbin`.
+The script runs two steps for the platform of the U50. The result is `build/xclbin/gemvqc16.xclbin`.
 
 1. `v++ -c`: HLS compile of `fpga/src/gemvqc16.cpp` with the operator latencies of `fpga/src/gemvqc16_timing.tcl`.
 2. `v++ -l`: link, placement and routing.
@@ -115,8 +115,10 @@ Data of the reference build:
   not build this variant.
 - The two-phase DeltaNet step is a build switch (`GEMVQC_GDN_TWO_PHASE` in `fpga/src/gemvqc16.h`, default 0). It
   saves the same time with 356 more DSPs and 23,800 more LUTs (HLS estimate). The state has the same bits. The
-  output can be different in the last bits. We tested this variant in the C simulation, in the RTL co-simulation
-  and in the emulator. We did not build a bitstream with it. Refer to [ROADMAP.md](ROADMAP.md), item A7.
+  output can be different in the last bits.
+
+  We tested this variant in the C simulation, in the RTL co-simulation and in the emulator. We did not build a
+  bitstream with it. Refer to [ROADMAP.md](ROADMAP.md), item A7.
 
 HBM connections (`fpga/connectivity.cfg`):
 
@@ -180,13 +182,15 @@ Measurement and diagnosis:
 
 ### 4.3 Direct start
 
-The XRT command scheduler needs 0.2 ms for each kernel launch. With 10–14 launches for each token, this is 2–3 ms.
+The command scheduler of XRT needs 0.2 ms for each kernel launch. With 10–14 launches for each token, this is
+2–3 ms.
 The direct start writes the control registers of the compute unit (6 µs) and then polls for completion. On the
 test machine, the direct start gives 12–15 % more tokens/s.
 
 The backend uses the direct start if the embedded scheduler of the driver is off (sysfs file `ert_disable` is 1).
 
-1. Load the bitstream one time with the scheduler on (`ert_disable` is 0). Each run of llama.cpp loads it.
+1. Load the bitstream one time with the scheduler on (`ert_disable` is 0). A run of llama.cpp loads the
+   bitstream.
 2. Get the PCI address from `xbutil examine`.
 3. Set `ert_disable` to 1.
 
@@ -194,7 +198,7 @@ The backend uses the direct start if the embedded scheduler of the driver is off
    echo 1 | sudo tee /sys/bus/pci/devices/0000:08:00.1/ert_disable
    ```
 
-4. Run llama.cpp as usual. The backend now starts the kernel directly.
+4. Run llama.cpp with the commands of section 4.1. The backend now starts the kernel directly.
 
 **CAUTION:** Set `ert_disable` to 0 before you load a different bitstream. If you do not do this, the driver can
 deadlock. The backend does not load a different bitstream while `ert_disable` is 1.
@@ -212,10 +216,11 @@ GGML_XRT_VERIFY_CALLS=1000 build/llama.cpp/build/bin/llama-completion \
     -m models/Qwen3.5-4B-Q4_0.gguf -ngl 99 -no-cnv -n 16 -p "The capital of France is" 2>&1 | grep XRT-VERIFY | sort | uniq -c | head
 ```
 
-For each checked operation (GEMV, RMSNorm, add, SwiGLU, convolution, DeltaNet step), the backend shows `PASS` and
-the largest absolute difference to the CPU reference. If an operation is outside the tolerance, the process stops
-with `FAIL`. The backend checks a fused command as one unit. With `GGML_XRT_VERIFY_CALLS=3000`, 16 generated tokens
-and the reference bitstream, all 3,208 checks were `PASS` for each of the three test models.
+The backend checks these operations: GEMV, RMSNorm, add, SwiGLU, convolution and the DeltaNet step. For each
+checked operation, it shows `PASS` and the largest absolute difference to the CPU reference. If an operation is
+outside the tolerance, the process stops with `FAIL`. The backend checks a fused command as one unit. With
+`GGML_XRT_VERIFY_CALLS=3000`, 16 generated tokens and the reference bitstream, all 3,208 checks were `PASS` for each
+of the three test models.
 
 ### 4.5 Emulator (no card)
 
@@ -236,18 +241,18 @@ The emulator has 20 engines and 250 MiB arenas, as the card. For 16 engines, add
 
 | Message or symptom | Possible cause and action |
 | --- | --- |
-| `XRT headers not found in ...` | `XILINX_XRT` is not set. Run `source /opt/xilinx/xrt/setup.sh` |
+| `XRT headers not found in ...` | The environment does not have `XILINX_XRT`. Run `source /opt/xilinx/xrt/setup.sh` |
 | `XRT Backend: cannot initialize device 0` | The host does not find the card. Check `xbutil examine`, the `xocl` driver and the permissions |
 | `XRT Backend: initialization failed ... xclbin` | The path in `GGML_XRT_XCLBIN` is wrong, or the bitstream is for a different platform |
 | `engine memory bank too small for the weight arena` | The HBM connections of the bitstream are different from `fpga/connectivity.cfg` |
 | `weight arenas full at tensor ...` | The offloaded weights of the model are larger than the 20 × 250 MiB arenas |
 | `XRT Backend: output head on the CPU` | The output head does not fit next to the layers. The output head runs on the CPU (slower, but correct) |
 | `ert_disable=1 and another xclbin is loaded` | Set `ert_disable` to 0 before you load a different bitstream |
-| `GGML_XRT_DIRECT_START needs ert_disable=1` | Set `ert_disable` to 1 (refer to section 4.3). Load the bitstream before |
+| `GGML_XRT_DIRECT_START needs ert_disable=1` | Load the bitstream first. Then set `ert_disable` to 1 (refer to section 4.3) |
 | `XRT kernel wait timed out` | The kernel stopped. Increase `GGML_XRT_WAIT_TIMEOUT_MS` or reset the card (`xbutil reset`) |
 | Slower than the README values | Set `OMP_WAIT_POLICY=ACTIVE` and `-t` (number of cores). Make sure that the direct start is on. Stop other load on the host |
 | `v++ ... ERROR ... platform` | `PLATFORM` is not the `.xpfm` file of the development platform |
 | Kernel clock below 100 MHz or `hbm_aclk` below 450 MHz after the link | `v++` decreased a clock to meet the timing (refer to section 3). Check `gemvqc16.xclbin.info` |
 
-We measured the README values on a host with a PCIe link at 5 GT/s x8. The U50 supports Gen3 x16. Gen3 x16 makes
-the first weight upload faster. It does not change the token speed.
+We measured the README values on a host with a PCIe link at 5 GT/s x8. The U50 supports Gen3 x16. A Gen3 x16 link
+makes the first upload of the weights faster. It does not change the token speed.

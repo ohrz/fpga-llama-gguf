@@ -17,8 +17,9 @@ Because of this, the card calculates the same model as the CPU.
 
 ## Results
 
-Token generation in tokens/s, `llama-bench` with 128 generated tokens and 16 threads. U50: mean of 5 runs. CPU:
-mean of 3 runs. The CPU is the host CPU of the card (AMD Ryzen Threadripper 1950X, 16 cores, no AVX-512).
+The table gives the token generation speed in tokens/s. We used `llama-bench` with 128 generated tokens and 16
+threads. The U50 values are the mean of 5 runs. The CPU values are the mean of 3 runs. The CPU is the host CPU of
+the card: AMD Ryzen Threadripper 1950X, 16 cores, no AVX-512.
 
 | Model (GGUF) | CPU only | Alveo U50 | Speed-up |
 | --- | --- | --- | --- |
@@ -26,9 +27,9 @@ mean of 3 runs. The CPU is the host CPU of the card (AMD Ryzen Threadripper 1950
 | Qwen3.5-4B Q8_0 | 10.75 | **21.13** | 1.97× |
 | Qwen3.5-9B Q4_0 | 9.98 | **19.26** | 1.93× |
 
-Bitstream: 20 engines, kernel clock 94.8 MHz, HBM clock 347.9 MHz. All values use the direct register start of the
-kernel (refer to [docs/BUILD.md](docs/BUILD.md#43-direct-start)). The CPU values come from the same host and the same
-llama.cpp commit (measured in October 2026).
+The bitstream has 20 engines, a kernel clock of 94.8 MHz and an HBM clock of 347.9 MHz. All values use the direct
+register start of the kernel (refer to [docs/BUILD.md](docs/BUILD.md#43-direct-start)). We measured the CPU values in
+October 2026 on the same host with the same llama.cpp commit.
 
 ### Performance history
 
@@ -86,8 +87,8 @@ Notes:
   - the prompt and the sampler
   - tensors in formats that the card does not support.
 
-For the full flow diagram and more data, refer to [docs/DESIGN.md](docs/DESIGN.md). For the plan to increase the speed, refer to
-[docs/ROADMAP.md](docs/ROADMAP.md).
+For the full flow diagram and more data, refer to [docs/DESIGN.md](docs/DESIGN.md). For the plan to increase the
+speed, refer to [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Requirements
 
@@ -99,9 +100,10 @@ For the full flow diagram and more data, refer to [docs/DESIGN.md](docs/DESIGN.m
 | Bitstream build | **Vitis / Vivado 2025.2** (with Vitis HLS), 48 GB RAM, 3–4 hours |
 | llama.cpp | commit **`c92e806d1c81091c9035edce99c35374da1b465e`** (11 July 2026) with the patches of this repository |
 
-The build script downloads llama.cpp at the commit above (release `b9972`). All measured values use this version.
-To build with release `b12602` (November 2026), set `LLAMA_CPP_VERSION=b12602`. We tested this version only in the
-emulator. For the status, refer to [docs/ROADMAP.md](docs/ROADMAP.md#35-newer-llamacpp).
+The build script downloads llama.cpp at the commit above (release `b9972`). All values in the tables use this
+version. To build with release `b12602` (November 2026), set `LLAMA_CPP_VERSION=b12602`. We tested `b12602` in the
+emulator and on the card. On the card, `b12602` is 0.43–0.49 ms slower for each token than `b9972`. For the status,
+refer to [docs/ROADMAP.md](docs/ROADMAP.md#35-newer-llamacpp).
 
 ## Quick start
 
@@ -131,20 +133,25 @@ emulator. For the status, refer to [docs/ROADMAP.md](docs/ROADMAP.md#35-newer-ll
 
 5. To get the results table (CPU only and U50 for the three test models), run `scripts/benchmark.sh`.
 
-The first run uploads the repacked weights to the card. This takes some time.
+The first run uploads the repacked weights to the card. Because of this, the first run is slower than the next
+runs.
 
 To check the results of the card, set `GGML_XRT_VERIFY_CALLS=1000`. The backend then compares the first 1000
 offloaded operations with a CPU reference. It shows `XRT-VERIFY: PASS` for each operation, or it stops. For the full
 build procedure, the options and the fault isolation, refer to **[docs/BUILD.md](docs/BUILD.md)**.
 
-You can use the backend without a card. Build with `VITIS_INCLUDE=/opt/Xilinx/2025.2/Vitis/include
-scripts/build_llama.sh` and run with `GGML_XRT_EMULATE=1`. The host then runs the C++ model of the kernel. The
-emulator is slow: one to two minutes for each token of the 4B model.
+To use the backend without a card, use the emulator:
+
+1. Build with `VITIS_INCLUDE=/opt/Xilinx/2025.2/Vitis/include scripts/build_llama.sh`.
+2. Run with `GGML_XRT_EMULATE=1`.
+
+The host then runs the C++ model of the kernel. The emulator is slow: one to two minutes for each token of the 4B
+model.
 
 ## Test data
 
-We measured all values with these files. The files are not in this repository. Download them from Hugging Face and
-compare the SHA-256.
+We measured all values with these files. The files are not in this repository. Download them from Hugging Face.
+Then compare the SHA-256 values with the table.
 
 | File | Size (bytes) | SHA-256 |
 | --- | --- | --- |
@@ -179,16 +186,18 @@ The "Q4_0" files contain more than one format. The card calculates the Q4_0, Q8_
 - **Formats.** The card supports Q4_0, Q8_0, Q5_K and Q6_K. Q4_1 and all other quantizations stay on the CPU. The
   matrix width must be a multiple of 128 (256 for K-quants) and a maximum of 16384.
 - **Numerics.** The results agree with the CPU in the tolerance, but they are not bit-identical. The card
-  calculates each row exactly: integer block products, exact scale products, a fixed-point row sum and one rounding
-  to FP32. The CPU kernels of ggml round in FP32 at each step. In a greedy test with 16 tokens, the text was the
-  same as on the CPU for the two Q4_0 models. Qwen3.5-4B Q8_0 had a different text from the third token. All
-  checked operations were in the tolerance.
-- **Hardware.** We tested one U50 in one host (PCIe link at 5 GT/s x8). We did not test other XRT versions,
-  platform versions or cards.
-- **Timing.** The reference build did not meet the requested clocks. The tool decreased the kernel clock to
-  94.8 MHz (worst paths in the DeltaNet stages and the command loop). It decreased the HBM clock to 347.9 MHz
-  (paths in the HBM interconnect of the platform). An HBM port at 347.9 MHz moves 11 GB/s. An engine needs 6.1 GB/s.
-  A different tool run can give different clocks.
+  calculates each row exactly: integer products for each block, exact scale products, a fixed-point sum for each
+  row and one rounding to FP32. The CPU kernels of ggml round in FP32 at each step.
+- **Text.** In a greedy test with 16 tokens, the text was the same as on the CPU for the two Q4_0 models.
+  Qwen3.5-4B Q8_0 had a different text from the third token. All checked operations were in the tolerance.
+- **Hardware.** We tested one U50 in one host. The PCIe link of this host runs at 5 GT/s x8. We tested two XRT
+  versions (refer to [docs/BUILD.md](docs/BUILD.md#1-prerequisites)). We did not test other platform versions or
+  other cards.
+- **Timing.** The reference build did not meet the requested clocks. `v++` decreased the kernel clock to 94.8 MHz.
+  The worst paths are in the DeltaNet stages and in the command loop. `v++` decreased the HBM clock to 347.9 MHz,
+  because of paths in the HBM interconnect of the platform. A different run of `v++` can give different clocks.
+- **Port bandwidth.** The lower HBM clock is not a limit for the engines. An HBM port at 347.9 MHz moves 11 GB/s.
+  An engine needs 6.1 GB/s.
 
 ## Repository layout
 
@@ -203,8 +212,8 @@ The "Q4_0" files contain more than one format. The card calculates the Q4_0, Q8_
 
 ## License
 
-The code in this repository has the **Apache License 2.0** ([LICENSE](LICENSE), [NOTICE](NOTICE)). It changes
-llama.cpp (MIT). It needs XRT, Vitis and the Alveo platform of AMD under their licenses. Refer to
+The code in this repository has the **Apache License 2.0** ([LICENSE](LICENSE), [NOTICE](NOTICE)). The patches
+change llama.cpp (MIT). It needs XRT, Vitis and the Alveo platform of AMD under their licenses. Refer to
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 This project has no relation to AMD, Hugging Face, llama.cpp, unsloth or Alibaba. Product names are trademarks of

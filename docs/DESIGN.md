@@ -92,10 +92,10 @@ The hardware has one instance of it. One pass can do more than one command:
 - **Deferred norm.** A deferred `RMSNORM` keeps its row in the chip. The next GEMVs on this row normalize the
   values when they quantize them. The arithmetic is the same as for the stored result.
 - **DeltaNet step.** The `GDN` step uses a copy of the state in URAM. `STATE_LOAD` reads the next state before
-  the step. The kernel writes the old state back during later GEMV passes.
+  the step. During later GEMV passes, the kernel writes the old state to HBM.
 - **Output projection in the DeltaNet pass.** The GEMV on the step output (`ssm_out`, with its residual add) runs
-  in the pass of the step. This GEMV reads its weights in blocks of 256 columns. It starts when the first heads
-  come out of the step.
+  in the pass of the step. This GEMV reads its weights in blocks of 256 columns. It starts when the step gives
+  its first heads.
 
 Each fused form gives the same values as the plain command sequence.
 
@@ -104,15 +104,16 @@ Each fused form gives the same values as the plain command sequence.
 - Row `r` of a matrix is in engine `r % 20`. All engines work on their rows at the same time. Each engine writes
   one result for each row to the activation buffer.
 - An engine processes one weight word (64 bytes) for each clock: 4 blocks of 32 weights for Q4_0, 2 blocks for Q8_0.
-- The block dot products use exact integer arithmetic. For Q4_0 and Q8_0, the engine multiplies the two FP16 block
-  scales (weight and activation) exactly on the significands. It adds the product to an 80-bit fixed-point
-  accumulator. At the end of the row, it rounds to FP32 one time. The result does not depend on the sequence of the
-  additions.
+- The engine calculates the dot product of each block with exact integer arithmetic. For Q4_0 and Q8_0, it
+  multiplies the FP16 scale of the weight block and the FP16 scale of the activation block. This multiplication is
+  exact on the significands. The engine adds the product to an 80-bit fixed-point accumulator. At the end of the
+  row, it rounds to FP32 one time. The result does not depend on the sequence of the additions.
 - An engine has 64 DSP multipliers for the products of a word. One multiplier calculates the sum of two products
-  of 4-bit weights (Q4_0, Q5_K, Q6_K). For Q8_0, one multiplier calculates one product. The engine uses the weights
-  without their offset (Q4_0: 8, Q6_K: 32, Q8_0: 128). It then subtracts the offset times the sum of the
-  activations. The quantizer supplies these sums. The two scale multipliers of a lane are shared by the formats.
-  The result has the same bits as a calculation with one multiplier for each product.
+  of 4-bit weights (Q4_0, Q5_K, Q6_K). For Q8_0, one multiplier calculates one product. All formats use the same
+  two scale multipliers of a lane. The result has the same bits as a calculation with one multiplier for each
+  product.
+- The engine uses the weights without their offset (Q4_0: 8, Q6_K: 32, Q8_0: 128). It then subtracts the offset
+  times the sum of the activations. The quantizer supplies these sums.
 - The quantizer quantizes the activation vector as ggml does for the related weight type. It uses `Q8_0` for Q4_0
   and Q8_0 weights, and `Q8_K` for Q5_K and Q6_K weights. All engines get the same quantized vector.
 - K-quants use super-blocks of 256 weights: one metadata word with the scales, then the quant words.
@@ -152,7 +153,7 @@ With 16 engines (`GEMVQC16_ENGINES` 16), each engine port uses a channel pair `[
   The ggml scheduler gives all other nodes to the CPU backend.
 - **Command lists.** The backend makes one list from each sequence of accepted nodes. It copies inputs from host
   memory to the input region of the activation buffer. The results stay on the card. The backend copies a result
-  back only if a later CPU split or a graph output reads it.
+  to the host only if a later CPU split or a graph output reads it.
 - **Fusions.** The backend maps node patterns to the fused commands of section 2.2. `GGML_XRT_FEATURE_MASK` hides
   fusion bits of the kernel for diagnosis.
 - **Plan cache.** The backend stores the analysis of a split (fusions, skipped nodes, use counts) under a
@@ -173,8 +174,9 @@ With 16 engines (`GEMVQC16_ENGINES` 16), each engine port uses a channel pair `[
 
 ## 4. Time for each token
 
-Measured with `GGML_XRT_TIMING`: 72 tokens minus 8 tokens (the weights are on the card). Reference bitstream (20
-engines, kernel 94.8 MHz, HBM 347.9 MHz), direct start.
+We measured these values with `GGML_XRT_TIMING`. The values are the difference between a run with 72 tokens and a
+run with 8 tokens. Because of this, the upload of the weights is not part of the values. We used the reference
+bitstream (20 engines, kernel 94.8 MHz, HBM 347.9 MHz) and the direct start.
 
 | Model | Time for each token (`llama-bench`) | Card busy | Weights for each token | Launches for each token | Card throughput |
 | --- | --- | --- | --- | --- | --- |
@@ -183,7 +185,7 @@ engines, kernel 94.8 MHz, HBM 347.9 MHz), direct start.
 | Qwen3.5-9B Q4_0 | 51.9 ms | 46.0 ms | 4.67 GB | 14 | 101 GB/s |
 
 The other time (3–6 ms) is host work: the attention core of the 8 attention layers, the four Q4_1 matrices,
-copies and sampling.
+copies and the sampler.
 
 The 20 engines read a maximum of 20 × 64 B × 94.8 MHz = 121 GB/s. The cycle trace (`GGML_XRT_TRACE=1`) shows the
 GEMV passes at 96 % of this value. The other card time has these causes:
@@ -201,7 +203,7 @@ GEMV passes at 96 % of this value. The other card time has these causes:
   measure this value.
 - **Stream content.** Qwen3.5-4B Q4_0 has 2.57 GB of weights for each token: 71 % Q4_0, 27 % K-quants (output head
   and `ssm_out`) and 2 % Q4_1. The card reads 2.51 GB. The four Q4_1 matrices stay on the CPU.
-- **Compute.** For Q4_0, the engines are almost at their compute limit. The peak is 20 × 128 products × 94.8 MHz
+- **Compute.** For Q4_0, the engines are near their compute limit. The peak is 20 × 128 products × 94.8 MHz
   = 243 GMAC/s. The 4B model needs 4.4 GMAC for each token. At the streaming limit, this is 88 % of the multipliers.
 
 These changes can increase the speed:
